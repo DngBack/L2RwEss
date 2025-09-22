@@ -23,7 +23,7 @@ CONFIG = {
         'num_classes': 100,
     },
     'model_name': 'argse_balanced', # 'argse_balanced' or 'argse_worst'
-    'checkpoint_path': './checkpoints/argse/cifar100_lt/argse_balanced.ckpt',
+    'checkpoint_path': './checkpoints/argse_worst/cifar100_lt/argse_worst.ckpt',
     'experts': {
         'names': ['ce', 'logitadjust', 'balsoftmax'],
         'logits_dir': './outputs/logits',
@@ -33,7 +33,7 @@ CONFIG = {
         'bootstrap_n': 1000, # Giảm xuống 100 để chạy nhanh hơn
         'bootstrap_ci': 0.95,
     },
-    'output_dir': './results/cifar100_lt',
+    'output_dir': './results-worst/cifar100_lt',
     'seed': 42
 }
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'

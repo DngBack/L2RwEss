@@ -28,7 +28,7 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balanced',
+        'mode': 'worst',
         'epochs': 100,
         'batch_size': 256,
         'c': 0.2,  # <-- TĂNG MẠNH TỪ 0.1 LÊN 0.2
@@ -49,7 +49,7 @@ CONFIG = {
         'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse',
+        'checkpoints_dir': './checkpoints/argse_worst',
     },
     'seed': 42
 }
