@@ -12,3 +12,4 @@ rich
 einops
 pytest
 pytest-mock
+tqdm
