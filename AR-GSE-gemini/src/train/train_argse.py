@@ -19,26 +19,26 @@ from src.data.datasets import get_cifar100_lt_counts
 # --- CONFIGURATION (sẽ được thay thế bằng Hydra) ---
 CONFIG = {
     'dataset': {
-        'name': 'cifar100_lt_if100',
+        'name': 'cifar100_lt',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
     },
     'experts': {
         'names': ['ce', 'logitadjust', 'balsoftmax'], # Cần khớp với output của M2
-        'logits_dir': './outputs/logits',
+        'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balanced',  # 'balanced' or 'worst'
+        'mode': 'balanced',
         'epochs': 100,
         'batch_size': 256,
-        'c': 0.05, # Chi phí từ chối
+        'c': 0.2,  # <-- TĂNG MẠNH TỪ 0.1 LÊN 0.2
         'alpha_clip': 1e-3,
         'lambda_ent': 1e-3,
     },
     'optimizers': {
-        'phi_lr': 1e-3,
-        'alpha_mu_lr': 5e-3,
-        'rho': 1e-2, # Dual learning rate
+        'phi_lr': 5e-4,       # Giữ nguyên LR thấp cho Gating
+        'alpha_mu_lr': 2.5e-3, # Giữ nguyên LR thấp
+        'rho': 5e-3,          # Giữ nguyên LR thấp
     },
     'scheduler': {
         'tau_start': 2.0,
@@ -106,7 +106,7 @@ def update_beta_eg(current_beta, group_errors, xi):
     return new_beta / new_beta.sum()
 
 def eval_epoch(model, loader, c, class_to_group):
-    """Evaluates the model with hard rejection decisions."""
+    """Evaluates the model with hard rejection decisions. (Phiên bản đã sửa lỗi device)"""
     model.eval()
     
     all_margins = []
@@ -118,16 +118,18 @@ def eval_epoch(model, loader, c, class_to_group):
             logits, labels = logits.to(DEVICE), labels.to(DEVICE)
             
             # Forward pass to get margin
-            # tau doesn't matter for hard decision, only margin's sign
             outputs = model(logits, c, 1.0, class_to_group)
             
             # Get prediction from mixed posterior
             _, preds = torch.max(outputs['eta_mix'], 1)
             
-            all_margins.append(outputs['margin'].cpu())
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
+            # --- THAY ĐỔI Ở ĐÂY ---
+            # Giữ tất cả các tensor trên GPU để tính toán nhất quán
+            all_margins.append(outputs['margin'])
+            all_preds.append(preds)
+            all_labels.append(labels)
 
+    # Nối các tensor lại, tất cả đều đang ở trên GPU
     all_margins = torch.cat(all_margins)
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
@@ -141,17 +143,17 @@ def eval_epoch(model, loader, c, class_to_group):
     if num_accepted == 0:
         return {'coverage': 0, 'balanced_error': 1.0, 'worst_error': 1.0, 'group_errors': [1.0] * model.num_groups}
 
-    # Filter for accepted samples
+    # Filter for accepted samples (vẫn ở trên GPU)
     accepted_preds = all_preds[accepted_mask]
     accepted_labels = all_labels[accepted_mask]
     
-    # Calculate per-group errors on the accepted set
+    # Calculate per-group errors on the accepted set (tất cả đều trên GPU, không còn lỗi)
     accepted_groups = class_to_group[accepted_labels]
     group_errors = []
     for k in range(model.num_groups):
         group_mask = (accepted_groups == k)
         if group_mask.sum() == 0:
-            group_errors.append(1.0) # Max error if no samples from this group are accepted
+            group_errors.append(1.0)
             continue
         
         correct_in_group = (accepted_preds[group_mask] == accepted_labels[group_mask]).sum().item()
@@ -176,7 +178,8 @@ def main():
     
     # 2. Get class/group info
     class_counts = get_cifar100_lt_counts(imb_factor=100) # Assuming IF=100 from M1
-    class_to_group = get_class_to_group(class_counts, K=2, head_ratio=0.5) # Assuming K=2 from M1
+    # class_to_group = get_class_to_group(class_counts, K=2, head_ratio=0.5) # Assuming K=2 from M1
+    class_to_group = get_class_to_group(class_counts, K=2, head_ratio=0.5).to(DEVICE)
     num_groups = class_to_group.max().item() + 1
     
     # 3. Initialize Model and Optimizers
@@ -201,6 +204,9 @@ def main():
     # 5. Training Loop
     best_val_metric = float('inf')
     epochs_no_improve = 0
+    
+    # KHỞI TẠO BIẾN EMA Ở ĐÂY, BÊN NGOÀI VÒNG LẶP EPOCH
+    ema_cons_violation = torch.zeros(num_groups, device=DEVICE)
 
     for epoch in range(CONFIG['argse_params']['epochs']):
         print(f"\n--- Epoch {epoch+1}/{CONFIG['argse_params']['epochs']} ---")
@@ -219,8 +225,16 @@ def main():
                 'alpha_clip': CONFIG['argse_params']['alpha_clip'],
                 'rho': CONFIG['optimizers']['rho'],
             }
-            stats = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
+            # stats = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
+            stats, cons_violation_batch = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
             
+            ema_decay = 0.9 # Hệ số làm mượt
+            ema_cons_violation = ema_decay * ema_cons_violation + (1 - ema_decay) * cons_violation_batch.detach()
+            
+            # CẬP NHẬT DUAL BẰNG GIÁ TRỊ EMA
+            with torch.no_grad():
+                model.Lambda.data = (model.Lambda + params['rho'] * ema_cons_violation).clamp_min(0.0)
+
             for k, v in stats.items():
                 epoch_stats[k].append(v)
         
