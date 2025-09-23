@@ -29,74 +29,80 @@ def estimate_group_acceptance(s_tau, y_true, class_to_group, num_groups):
     
     return acceptance_expectation_k
 
-def primal_dual_step(
-    model, batch, optimizers, loss_fn, params
-):
+def primal_dual_step(model, batch, optimizers, loss_fn, params):
     """
-    Thực hiện một bước cập nhật primal-dual cho AR-GSE.
-    Phiên bản cuối cùng đã sửa lỗi và thêm điều chuẩn alpha.
+    Performs one step of primal-dual optimization.
     """
-    # 1. Chuẩn bị dữ liệu và tham số
-    expert_logits, y_true = batch
-    expert_logits, y_true = expert_logits.to(params['device']), y_true.to(params['device'])
+    logits, labels = batch
+    logits = logits.to(params['device'])
+    labels = labels.to(params['device'])
     
-    class_to_group = params['class_to_group']
-    beta = params['beta']
+    # Zero gradients
+    for optimizer in optimizers.values():
+        optimizer.zero_grad()
     
-    # 2. Forward pass qua mô hình
-    outputs = model(expert_logits, params['c'], params['tau'], class_to_group)
-    eta_mix, s_tau, w = outputs['eta_mix'], outputs['s_tau'], outputs['w']
-
-    # 3. Tính toán các thành phần của hàm loss Lagrangian
-    # Lỗi phân loại chọn lọc
-    loss_cls = loss_fn(eta_mix, y_true, s_tau, beta, model.alpha, class_to_group)
+    # Forward pass
+    outputs = model(logits, params['c'], params['tau'], params['class_to_group'])
     
-    # Lỗi từ chối
-    loss_rej = params['c'] * (1 - s_tau).mean()
-
-    # Mức độ vi phạm ràng buộc (dùng cho cả loss và cập nhật dual sau này)
-    acc_k_hat = estimate_group_acceptance(s_tau.detach(), y_true, class_to_group, model.num_groups)
-    cons_violation = model.alpha - model.num_groups * acc_k_hat
+    # Primary loss: selective classification
+    loss_cls = loss_fn(
+        eta_mix=outputs['eta_mix'],
+        y_true=labels,
+        s_tau=outputs['s_tau'],
+        beta=params['beta'],
+        alpha=model.alpha,
+        class_to_group=params['class_to_group']
+    )
     
-    # Điều chuẩn cho trọng số gating (entropy)
-    entropy_w = -torch.sum(w * torch.log(w + 1e-8), dim=1).mean()
-    loss_reg = params['lambda_ent'] * entropy_w
-
-    # (CẢI TIẾN) Điều chuẩn để "neo giữ" alpha quanh giá trị 1.0
-    alpha_reg_strength = 0.1
-    loss_alpha_reg = alpha_reg_strength * ((model.alpha - 1.0)**2).sum()
-
-    # 4. Tính toán loss Lagrangian tổng hợp
-    L = loss_cls + loss_rej + (model.Lambda * cons_violation).sum() + loss_reg + loss_alpha_reg
+    # Entropy regularization
+    probs_mix = torch.softmax(outputs['eta_mix'], dim=1)
+    entropy = -torch.sum(probs_mix * torch.log(probs_mix + 1e-8), dim=1)
+    loss_ent = -params['lambda_ent'] * entropy.mean()
     
-    # 5. Cập nhật Primal (φ, α, μ)
-    for opt in optimizers.values():
-        opt.zero_grad()
-    L.backward()
-    for opt in optimizers.values():
-        opt.step()
-
-    # 6. Xử lý sau cho các biến Primal
+    # Total loss
+    loss_total = loss_cls + loss_ent
+    
+    # Backward pass
+    loss_total.backward()
+    
+    # Update primal variables
+    optimizers['phi'].step()
+    
+    # Clip alpha to prevent it from becoming too small
     with torch.no_grad():
-        model.alpha.data.clamp_(min=params['alpha_clip'])
-        model.mu.data -= model.mu.data.mean()
-
-    # (LƯU Ý) Cập nhật Dual (λ) đã được chuyển ra hàm main để sử dụng EMA
-
-    # 7. Trả về các chỉ số và mức độ vi phạm ràng buộc
-    stats = {
-        'loss_total': L.item(),
-        'loss_cls': loss_cls.item(),
-        'loss_rej': loss_rej.item(),
-        'loss_reg': (loss_reg + loss_alpha_reg).item(),
-        'mean_alpha': model.alpha.mean().item(),
-        'mean_mu': model.mu.mean().item(),
-        'mean_lambda': model.Lambda.mean().item(),
-        'mean_coverage': s_tau.mean().item(),
-    }
+        model.alpha.data = model.alpha.data.clamp(min=params['alpha_clip'])
+    
+    optimizers['alpha_mu'].step()
+    
+    # Calculate constraint violations using ACTUAL acceptance decisions (not probabilities)
+    margin = outputs['margin']
+    actual_acceptance = (margin > 0).float()  # Hard acceptance rule
+    
+    # Group coverage estimation using actual acceptance
+    sample_groups = params['class_to_group'][labels]
+    cons_violation = torch.zeros(model.num_groups, device=params['device'])
+    
     for k in range(model.num_groups):
-        stats[f'alpha_{k}'] = model.alpha[k].item()
-        stats[f'lambda_{k}'] = model.Lambda[k].item()
+        group_mask = (sample_groups == k)
+        if group_mask.sum() > 0:
+            group_coverage = actual_acceptance[group_mask].mean()
+            cons_violation[k] = torch.clamp(params['c'] - group_coverage, min=0.0)
+    
+    # Update dual variables IMMEDIATELY after primal update (correct primal-dual)
+    with torch.no_grad():
+        model.Lambda.data = (model.Lambda + params['rho'] * cons_violation).clamp_min(0.0)
+    
+    # Collect statistics
+    stats = {
+        'loss_cls': loss_cls.item(),
+        'loss_ent': loss_ent.item(), 
+        'loss_total': loss_total.item(),
+        'mean_coverage': actual_acceptance.mean().item(),
+        'mean_margin': margin.mean().item(),
+    }
+    
+    # Add per-group constraint violations to stats
+    for k in range(model.num_groups):
         stats[f'cons_viol_{k}'] = cons_violation[k].item()
         
     return stats, cons_violation

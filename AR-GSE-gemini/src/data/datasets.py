@@ -1,6 +1,6 @@
 # src/data/datasets.py
 import numpy as np
-import torchvision
+import torchvision.transforms as transforms
 from typing import List, Tuple
 
 def get_cifar100_lt_counts(imb_factor: int = 100, num_classes: int = 100) -> List[int]:
@@ -61,11 +61,60 @@ def generate_longtail_train_set(cifar100_train_dataset, imb_factor: int = 100) -
     
     return lt_indices, lt_targets
 
-# Augmentations can be defined here later, e.g., using torchvision.transforms
+# Data augmentations for CIFAR-100
+
 def get_train_augmentations():
-    # Placeholder for RandAug, Mixup, CutMix logic
-    pass
+    """
+    Get training augmentations for CIFAR-100.
+    Includes standard augmentations commonly used in long-tail learning.
+    """
+    return transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],  # CIFAR-100 mean
+            std=[0.2675, 0.2565, 0.2761]   # CIFAR-100 std
+        )
+    ])
 
 def get_eval_augmentations():
-    # Placeholder for normalize/center-crop
-    pass
+    """
+    Get evaluation augmentations for CIFAR-100.
+    Only normalization and tensor conversion for evaluation.
+    """
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.5071, 0.4867, 0.4408],  # CIFAR-100 mean
+            std=[0.2675, 0.2565, 0.2761]   # CIFAR-100 std
+        )
+    ])
+
+def get_randaug_train_augmentations(num_ops=2, magnitude=9):
+    """
+    Get training augmentations with RandAugment for stronger regularization.
+    Useful for long-tail learning where overfitting is a concern.
+    
+    Args:
+        num_ops: Number of augmentation operations to apply
+        magnitude: Magnitude of augmentation operations (0-30)
+    """
+    try:
+        from torchvision.transforms import RandAugment
+        
+        return transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(p=0.5),
+            RandAugment(num_ops=num_ops, magnitude=magnitude),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.5071, 0.4867, 0.4408],
+                std=[0.2675, 0.2565, 0.2761]
+            )
+        ])
+    except ImportError:
+        # Fallback to standard augmentations if RandAugment not available
+        print("Warning: RandAugment not available, using standard augmentations")
+        return get_train_augmentations()

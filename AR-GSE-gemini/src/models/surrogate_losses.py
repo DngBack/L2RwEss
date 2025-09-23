@@ -33,6 +33,8 @@ def selective_cls_loss(
         raise ValueError(f"Unknown loss kind: {kind}")
     
     # The term from the paper is: (beta_k / alpha_k) * loss * s_tau
-    weighted_loss = (sample_beta / (sample_alpha + 1e-8)) * per_sample_loss * s_tau
+    # Add gradient clipping to prevent explosion when alpha is small
+    alpha_safe = torch.clamp(sample_alpha, min=1e-3)  # Prevent alpha from being too small
+    weighted_loss = (sample_beta / alpha_safe) * per_sample_loss * s_tau
     
     return weighted_loss.mean()

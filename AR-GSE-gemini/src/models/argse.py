@@ -17,9 +17,9 @@ class AR_GSE(nn.Module):
 
         # Primal variables (learnable parameters)
         # Initialize alpha to 1 for all groups
-        self.alpha = nn.Parameter(torch.ones(num_groups))
-        # Initialize mu to 0 for all groups
-        self.mu = nn.Parameter(torch.zeros(num_groups))
+        self.alpha = nn.Parameter(torch.full((num_groups,), 1.0))  # Start with reasonable confidence scaling
+        # Initialize mu to negative values so threshold = c + mu is less than c (easier to accept)
+        self.mu = nn.Parameter(torch.full((num_groups,), -0.5))
         
         # Dual variables (not optimized by SGD, but part of state)
         self.register_buffer('Lambda', torch.zeros(num_groups))
@@ -42,8 +42,13 @@ class AR_GSE(nn.Module):
         gating_raw_weights = self.gating_net(gating_features)
         w = F.softmax(gating_raw_weights, dim=1) # Shape [B, E]
 
-        # 2. Mixture
-        expert_posteriors = F.softmax(expert_logits, dim=-1)
+        # 2. Apply temperature scaling to expert logits before mixture
+        # Temperature scaling helps with calibration (typical temperature ~2-4)
+        temperature = 2.0  # Reduce temperature for less conservative predictions
+        expert_logits_scaled = expert_logits / temperature
+        
+        # 3. Mixture with temperature-scaled logits
+        expert_posteriors = F.softmax(expert_logits_scaled, dim=-1)
         # einops is great for this: b e c -> b c
         eta_mix = torch.einsum('be,bec->bc', w, expert_posteriors)
         eta_mix = torch.clamp(eta_mix, min=1e-8) # for stability
@@ -66,17 +71,18 @@ class AR_GSE(nn.Module):
         mu = self.mu.to(device)
         class_to_group = class_to_group.to(device)
 
-        inv_a = 1.0 / (alpha + 1e-8) # [K]
-        g = class_to_group # [C]
+        # Score: max_y alpha_g(y) * eta_y (NOT divided by alpha)
+        # This encourages acceptance when confidence is high AND alpha is high
+        score_per_class = alpha[class_to_group] * eta_mix  # [B, C]
+        max_score, _ = score_per_class.max(dim=1)  # [B]
         
-        # Score: max_y eta_y / alpha_g(y)
-        score_per_class = eta_mix / inv_a[g] # Broadcasting [B, C] / [C] -> [B, C]
-        max_score, _ = score_per_class.max(dim=1) # [B]
+        # Threshold: c + mu_g (simplified threshold)
+        # Get the predicted class for threshold calculation
+        _, pred_class = eta_mix.max(dim=1)  # [B]
+        pred_groups = class_to_group[pred_class]  # [B]
+        threshold = c + mu[pred_groups]  # [B]
         
-        # Threshold: sum_y' (1/alpha_g(y') - mu_g(y')) * eta_y' - c
-        coeff = inv_a[g] - mu[g] # [C]
-        # einsum is safer than sum(eta_mix * coeff) for broadcasting
-        thr = torch.einsum('bc,c->b', eta_mix, coeff) - c # [B]
-        
-        margin = max_score - thr
+        # Margin: score - threshold
+        # Positive margin means accept, negative means reject
+        margin = max_score - threshold
         return margin

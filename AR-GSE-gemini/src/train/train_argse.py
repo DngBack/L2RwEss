@@ -31,19 +31,19 @@ CONFIG = {
         'mode': 'balance',
         'epochs': 100,
         'batch_size': 256,
-        'c': 0.2,  # <-- TĂNG MẠNH TỪ 0.1 LÊN 0.2
-        'alpha_clip': 1e-3,
-        'lambda_ent': 1e-3,
+        'c': 0.8,  # Increase coverage requirement to encourage acceptance
+        'alpha_clip': 1e-2,  # Increase minimum alpha
+        'lambda_ent': 1e-2,  # Increase entropy regularization
     },
     'optimizers': {
-        'phi_lr': 5e-4,       # Giữ nguyên LR thấp cho Gating
-        'alpha_mu_lr': 2.5e-3, # Giữ nguyên LR thấp
-        'rho': 5e-3,          # Giữ nguyên LR thấp
+        'phi_lr': 1e-3,       # Increase gating network learning rate
+        'alpha_mu_lr': 5e-3,  # Increase threshold learning rate
+        'rho': 1e-2,          # Increase dual variable update rate
     },
     'scheduler': {
-        'tau_start': 2.0,
-        'tau_end': 10.0,
-        'tau_warmup_epochs': 30,
+        'tau_start': 1.0,     # Start with lower temperature
+        'tau_end': 5.0,       # Lower final temperature
+        'tau_warmup_epochs': 20,  # Slower warmup
     },
     'worst_group_params': {
         'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
@@ -153,13 +153,19 @@ def eval_epoch(model, loader, c, class_to_group):
     for k in range(model.num_groups):
         group_mask = (accepted_groups == k)
         if group_mask.sum() == 0:
+            # If no samples from this group were accepted, assign maximum error
             group_errors.append(1.0)
             continue
         
         correct_in_group = (accepted_preds[group_mask] == accepted_labels[group_mask]).sum().item()
         total_in_group = group_mask.sum().item()
-        accuracy = correct_in_group / total_in_group
-        group_errors.append(1.0 - accuracy)
+        
+        # Handle edge case where total_in_group is 0 (shouldn't happen due to check above)
+        if total_in_group == 0:
+            group_errors.append(1.0)
+        else:
+            accuracy = correct_in_group / total_in_group
+            group_errors.append(1.0 - accuracy)
 
     return {
         'coverage': coverage,
@@ -204,9 +210,6 @@ def main():
     # 5. Training Loop
     best_val_metric = float('inf')
     epochs_no_improve = 0
-    
-    # KHỞI TẠO BIẾN EMA Ở ĐÂY, BÊN NGOÀI VÒNG LẶP EPOCH
-    ema_cons_violation = torch.zeros(num_groups, device=DEVICE)
 
     for epoch in range(CONFIG['argse_params']['epochs']):
         print(f"\n--- Epoch {epoch+1}/{CONFIG['argse_params']['epochs']} ---")
@@ -225,22 +228,23 @@ def main():
                 'alpha_clip': CONFIG['argse_params']['alpha_clip'],
                 'rho': CONFIG['optimizers']['rho'],
             }
-            # stats = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
+            # Primal-dual step now handles dual update internally
             stats, cons_violation_batch = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
             
-            ema_decay = 0.9 # Hệ số làm mượt
-            ema_cons_violation = ema_decay * ema_cons_violation + (1 - ema_decay) * cons_violation_batch.detach()
-            
-            # CẬP NHẬT DUAL BẰNG GIÁ TRỊ EMA
-            with torch.no_grad():
-                model.Lambda.data = (model.Lambda + params['rho'] * ema_cons_violation).clamp_min(0.0)
-
             for k, v in stats.items():
                 epoch_stats[k].append(v)
         
         # Log training stats for the epoch
         log_str = f"Epoch {epoch+1} | Tau: {tau:.2f} | Loss: {np.mean(epoch_stats['loss_total']):.4f}"
         log_str += f" | Coverage: {np.mean(epoch_stats['mean_coverage']):.3f}"
+        log_str += f" | Margin: {np.mean(epoch_stats['mean_margin']):.3f}"
+        
+        # Add debug info for first few epochs
+        if epoch < 5:
+            log_str += f" | Alpha: {model.alpha.mean().item():.3f}"
+            log_str += f" | Mu: {model.mu.mean().item():.3f}"
+            log_str += f" | Lambda: {model.Lambda.mean().item():.3f}"
+        
         print(log_str)
 
         # Evaluation
