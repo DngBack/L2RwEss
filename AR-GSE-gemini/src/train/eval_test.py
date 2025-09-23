@@ -1,4 +1,3 @@
-# src/train/eval_test.py
 import torch
 import torchvision
 import numpy as np
@@ -19,21 +18,23 @@ from src.metrics.bootstrap import bootstrap_ci
 # --- CONFIGURATION (sẽ được thay thế bằng Hydra) ---
 CONFIG = {
     'dataset': {
-        'name': 'cifar100_lt',
+        'name': 'cifar100_lt_if100', ## CẬP NHẬT: Tên dataset nhất quán
+        'splits_dir': './data/cifar100_lt_if100_splits', ## CẬP NHẬT: Đường dẫn tới split
         'num_classes': 100,
     },
-    'model_name': 'argse_balanced', # 'argse_balanced' or 'argse_worst'
-    'checkpoint_path': './checkpoints/argse_worst/cifar100_lt/argse_worst.ckpt',
+    'model_name': 'argse_balance', # or 'argse_worst'
+    'checkpoint_path': './checkpoints/argse_balance/cifar100_lt_if100/argse_balance.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
     'experts': {
-        'names': ['ce', 'logitadjust', 'balsoftmax'],
+        # Cập nhật tên expert cho khớp với M2 mới
+        'names': ['ce_baseline','logitadjust_baseline', 'balsoftmax_baseline'], #, 'logitadjust_baseline', 'balsoftmax_baseline'],
         'logits_dir': './outputs/logits',
     },
     'eval_params': {
         'coverage_points': [0.7, 0.8, 0.9],
-        'bootstrap_n': 1000, # Giảm xuống 100 để chạy nhanh hơn
+        'bootstrap_n': 1000,
         'bootstrap_ci': 0.95,
     },
-    'output_dir': './results-worst/cifar100_lt',
+    'output_dir': './results_balance_250923/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
     'seed': 42
 }
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -47,6 +48,7 @@ def main():
 
     # 1. Load Group Info
     class_counts = get_cifar100_lt_counts(imb_factor=100)
+    ## CẬP NHẬT: Giữ class_to_group trên CPU vì tất cả các hàm metrics đều chạy trên CPU
     class_to_group = get_class_to_group(class_counts, K=2, head_ratio=0.5)
     num_groups = class_to_group.max().item() + 1
     
@@ -58,28 +60,37 @@ def main():
     model.eval()
     print(f"Loaded model from {CONFIG['checkpoint_path']}")
 
-    # 3. Load Test Data (Logits and Labels)
-    print("Loading test logits and labels...")
+    # 3. Load Test Data (Logits and Labels for the LONG-TAIL test set)
+    print("Loading long-tail test logits and labels...")
     logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
+    splits_dir = Path(CONFIG['dataset']['splits_dir'])
     
-    stacked_logits = torch.zeros(10000, num_experts, CONFIG['dataset']['num_classes'])
+    with open(splits_dir / 'test_lt_indices.json', 'r') as f:
+        test_indices = json.load(f)
+    num_test_samples = len(test_indices)
+
+    stacked_logits = torch.zeros(num_test_samples, num_experts, CONFIG['dataset']['num_classes'])
     for i, expert_name in enumerate(CONFIG['experts']['names']):
-        logits_path = logits_root / expert_name / "test_logits.pt"
+        logits_path = logits_root / expert_name / "test_lt_logits.pt"
+        if not logits_path.exists():
+            raise FileNotFoundError(f"Logits file not found for expert '{expert_name}': {logits_path}. Please run M2 expert training first.")
         stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
     
-    test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
-    test_labels = torch.tensor(test_dataset.targets)
+    full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+    test_labels = torch.tensor(np.array(full_test_dataset.targets)[test_indices])
+
+    print(f"Successfully loaded {num_test_samples} samples for long-tail test set.")
 
     # 4. Get Model Predictions on Test Set
     with torch.no_grad():
-        # AR-GSE model expects a batch dimension, so add one
-        outputs = model(stacked_logits.to(DEVICE), c=0.05, tau=10.0, class_to_group=class_to_group)
+        # Chuyển class_to_group sang GPU chỉ cho bước forward này
+        outputs = model(stacked_logits.to(DEVICE), c=0.2, tau=10.0, class_to_group=class_to_group.to(DEVICE))
     
     margins = outputs['margin'].cpu()
     eta_mix = outputs['eta_mix'].cpu()
     _, preds = torch.max(eta_mix, 1)
 
-    # 5. Calculate All Metrics
+    # 5. Calculate All Metrics (class_to_group ở đây là phiên bản CPU, sẽ không có lỗi)
     results = {}
     print("\nCalculating metrics...")
 
@@ -96,8 +107,8 @@ def main():
 
     # 5.2 Bootstrap CI for AURC (Balanced)
     def aurc_metric_func(m, p, l):
-        rc_df = generate_rc_curve(m, p, l, class_to_group, num_groups, num_points=51) # Use fewer points for speed
-        return calculate_aurc(rc_df, 'balanced_error')
+        rc_df_boot = generate_rc_curve(m, p, l, class_to_group, num_groups, num_points=51)
+        return calculate_aurc(rc_df_boot, 'balanced_error')
 
     mean_aurc, lower, upper = bootstrap_ci((margins, preds, test_labels), aurc_metric_func, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
     results['aurc_balanced_bootstrap'] = {'mean': mean_aurc, '95ci_lower': lower, '95ci_upper': upper}
@@ -106,7 +117,6 @@ def main():
     # 5.3 Metrics @ Fixed Coverage
     results_at_coverage = {}
     for cov_target in CONFIG['eval_params']['coverage_points']:
-        # Find the margin threshold for this coverage
         threshold = torch.quantile(margins, 1.0 - cov_target)
         accepted_mask = margins >= threshold
         

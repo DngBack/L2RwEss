@@ -6,6 +6,61 @@ from sklearn.model_selection import train_test_split
 from typing import Dict, Any
 from collections import Counter
 
+def create_longtail_val_test_splits(
+    cifar100_test_dataset,
+    train_class_counts: list,
+    output_dir: Path,
+    val_size: float = 0.2,
+    seed: int = 42
+):
+    """
+    Tạo ra tập validation và test có phân phối long-tail từ tập test cân bằng gốc.
+    """
+    print("\nCreating long-tail validation and test sets...")
+    test_targets = np.array(cifar100_test_dataset.targets)
+    num_classes = len(train_class_counts)
+    
+    # Số lượng mẫu tối đa cho mỗi lớp trong tập test gốc là 100
+    max_samples_per_class_test = 100
+    
+    lt_test_pool_indices = []
+    
+    # Subsample tập test gốc để khớp với phân phối của tập train
+    for i in range(num_classes):
+        # Số lượng mẫu cần lấy cho lớp i phải nhỏ hơn hoặc bằng số lượng trong tập train
+        # và không được vượt quá số lượng có sẵn trong tập test (100)
+        num_samples_to_take = min(train_class_counts[i], max_samples_per_class_test)
+        
+        class_indices_in_test = np.where(test_targets == i)[0]
+        
+        # Lấy ngẫu nhiên các chỉ số từ tập test
+        sampled_indices = np.random.choice(class_indices_in_test, num_samples_to_take, replace=False)
+        lt_test_pool_indices.extend(sampled_indices)
+        
+    lt_test_pool_indices = np.array(lt_test_pool_indices)
+    lt_test_pool_targets = test_targets[lt_test_pool_indices]
+    
+    print(f"Created a long-tail pool from test set with {len(lt_test_pool_indices)} samples.")
+    
+    # Chia pool này thành 20% validation và 80% test
+    val_indices, test_indices = train_test_split(
+        lt_test_pool_indices,
+        test_size=1.0 - val_size,
+        random_state=seed,
+        stratify=lt_test_pool_targets
+    )
+    
+    splits = {
+        'val_lt': val_indices.tolist(),
+        'test_lt': test_indices.tolist()
+    }
+    
+    for name, indices in splits.items():
+        filepath = output_dir / f"{name}_indices.json"
+        print(f"Saving {name} split with {len(indices)} samples to {filepath}")
+        with open(filepath, 'w') as f:
+            json.dump(indices, f)
+
 def safe_train_test_split(X, y, test_size, random_state, min_samples_per_class=2):
     """
     Performs train_test_split with stratification, falling back to random split if 

@@ -19,16 +19,16 @@ from src.data.datasets import get_cifar100_lt_counts
 # --- CONFIGURATION (sẽ được thay thế bằng Hydra) ---
 CONFIG = {
     'dataset': {
-        'name': 'cifar100_lt',
+        'name': 'cifar100_lt_if100',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
     },
     'experts': {
-        'names': ['ce', 'logitadjust', 'balsoftmax'], # Cần khớp với output của M2
+        'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'], # Cần khớp với output của M2
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'worst',
+        'mode': 'balance',
         'epochs': 100,
         'batch_size': 256,
         'c': 0.2,  # <-- TĂNG MẠNH TỪ 0.1 LÊN 0.2
@@ -49,7 +49,7 @@ CONFIG = {
         'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse_worst',
+        'checkpoints_dir': './checkpoints/argse_balance',
     },
     'seed': 42
 }
