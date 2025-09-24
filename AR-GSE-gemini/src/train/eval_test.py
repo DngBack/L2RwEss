@@ -22,8 +22,8 @@ CONFIG = {
         'splits_dir': './data/cifar100_lt_if100_splits', ## CẬP NHẬT: Đường dẫn tới split
         'num_classes': 100,
     },
-    'model_name': 'argse_balance', # or 'argse_worst'
-    'checkpoint_path': './checkpoints/argse_balance/cifar100_lt_if100/argse_balance.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
+    'model_name': 'argse_worst', # or 'argse_worst'
+    'checkpoint_path': './checkpoints/argse_worst/cifar100_lt_if100/argse_worst.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
     'experts': {
         # Cập nhật tên expert cho khớp với M2 mới
         'names': ['ce_baseline','logitadjust_baseline', 'balsoftmax_baseline'], #, 'logitadjust_baseline', 'balsoftmax_baseline'],
@@ -88,7 +88,12 @@ def main():
     
     margins = outputs['margin'].cpu()
     eta_mix = outputs['eta_mix'].cpu()
-    _, preds = torch.max(eta_mix, 1)
+    
+    # Use re-weighted prediction: h_α(x) = argmax_y α_{grp(y)} * η̃_y(x)
+    alpha = model.alpha.cpu()
+    class_to_group_cpu = class_to_group.cpu()
+    reweighted_scores = alpha[class_to_group_cpu] * eta_mix  # [N, C]
+    _, preds = torch.max(reweighted_scores, 1)
 
     # 5. Calculate All Metrics (class_to_group ở đây là phiên bản CPU, sẽ không có lỗi)
     results = {}

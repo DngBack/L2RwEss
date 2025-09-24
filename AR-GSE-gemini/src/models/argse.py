@@ -18,8 +18,8 @@ class AR_GSE(nn.Module):
         # Primal variables (learnable parameters)
         # Initialize alpha to 1 for all groups
         self.alpha = nn.Parameter(torch.full((num_groups,), 1.0))  # Start with reasonable confidence scaling
-        # Initialize mu to negative values so threshold = c + mu is less than c (easier to accept)
-        self.mu = nn.Parameter(torch.full((num_groups,), -0.5))
+        # Initialize mu to 0 as per paper (will be centered during training anyway)
+        self.mu = nn.Parameter(torch.zeros(num_groups))
         
         # Dual variables (not optimized by SGD, but part of state)
         self.register_buffer('Lambda', torch.zeros(num_groups))
@@ -71,18 +71,20 @@ class AR_GSE(nn.Module):
         mu = self.mu.to(device)
         class_to_group = class_to_group.to(device)
 
-        # Score: max_y alpha_g(y) * eta_y (NOT divided by alpha)
-        # This encourages acceptance when confidence is high AND alpha is high
+        # Score: max_y alpha_g(y) * eta_y 
         score_per_class = alpha[class_to_group] * eta_mix  # [B, C]
         max_score, _ = score_per_class.max(dim=1)  # [B]
         
-        # Threshold: c + mu_g (simplified threshold)
-        # Get the predicted class for threshold calculation
-        _, pred_class = eta_mix.max(dim=1)  # [B]
-        pred_groups = class_to_group[pred_class]  # [B]
-        threshold = c + mu[pred_groups]  # [B]
+        # Threshold: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x) - c
+        # Compute (1/alpha - mu) for each class
+        inv_alpha_minus_mu = 1.0 / alpha[class_to_group] - mu[class_to_group]  # [C]
+        inv_alpha_minus_mu = inv_alpha_minus_mu.unsqueeze(0).expand(eta_mix.size(0), -1)  # [B, C]
         
-        # Margin: score - threshold
+        # Weighted sum: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x)
+        weighted_sum = (inv_alpha_minus_mu * eta_mix).sum(dim=1)  # [B]
+        threshold = weighted_sum - c  # [B]
+        
+        # Margin: score - threshold  
         # Positive margin means accept, negative means reject
         margin = max_score - threshold
         return margin

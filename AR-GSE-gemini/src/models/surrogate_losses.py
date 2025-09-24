@@ -32,9 +32,9 @@ def selective_cls_loss(
     else:
         raise ValueError(f"Unknown loss kind: {kind}")
     
-    # The term from the paper is: (beta_k / alpha_k) * loss * s_tau
-    # Add gradient clipping to prevent explosion when alpha is small
-    alpha_safe = torch.clamp(sample_alpha, min=1e-3)  # Prevent alpha from being too small
-    weighted_loss = (sample_beta / alpha_safe) * per_sample_loss * s_tau
+    # The classification loss from paper: 
+    # L_cls = Σ_k β_k * α_k * (1/|B|) * Σ_{i∈B} ℓ_cls(x_i, y_i; η̃) * s_τ(x_i) * I{y_i∈G_k}
+    # Per sample: β_k * α_k * ℓ_cls * s_τ (NOT division!)
+    weighted_loss = sample_beta * sample_alpha * per_sample_loss * s_tau
     
     return weighted_loss.mean()

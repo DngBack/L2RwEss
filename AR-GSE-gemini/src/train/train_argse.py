@@ -28,7 +28,7 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balanced',
+        'mode': 'worst',  # 'balanced' hoặc 'worst'
         'epochs': 100,
         'batch_size': 256,
         'c': 0.2,  # Increase coverage requirement to encourage acceptance
@@ -120,8 +120,10 @@ def eval_epoch(model, loader, c, class_to_group):
             # Forward pass to get margin
             outputs = model(logits, c, 1.0, class_to_group)
             
-            # Get prediction from mixed posterior
-            _, preds = torch.max(outputs['eta_mix'], 1)
+            # Get prediction using re-weighted scores: h_α(x) = argmax_y α_{grp(y)} * η̃_y(x)
+            alpha = model.alpha.to(logits.device)
+            reweighted_scores = alpha[class_to_group] * outputs['eta_mix']  # [B, C]
+            _, preds = torch.max(reweighted_scores, 1)
             
             # --- THAY ĐỔI Ở ĐÂY ---
             # Giữ tất cả các tensor trên GPU để tính toán nhất quán
