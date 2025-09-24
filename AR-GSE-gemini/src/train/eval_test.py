@@ -11,7 +11,7 @@ from src.models.argse import AR_GSE
 from src.data.groups import get_class_to_group
 from src.data.datasets import get_cifar100_lt_counts
 from src.metrics.selective_metrics import calculate_selective_errors
-from src.metrics.rc_curve import generate_rc_curve, calculate_aurc
+from src.metrics.rc_curve import generate_rc_curve, generate_rc_curve_from_02, calculate_aurc, calculate_aurc_from_02
 from src.metrics.calibration import calculate_ece
 from src.metrics.bootstrap import bootstrap_ci
 
@@ -34,7 +34,7 @@ CONFIG = {
         'bootstrap_n': 1000,
         'bootstrap_ci': 0.95,
     },
-    'output_dir': './results_balance_250923/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
+    'output_dir': './results_balance/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
     'seed': 42
 }
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -94,7 +94,7 @@ def main():
     results = {}
     print("\nCalculating metrics...")
 
-    # 5.1 RC Curve and AURC
+    # 5.1 RC Curve and AURC (Full range 0.0-1.0)
     rc_df = generate_rc_curve(margins, preds, test_labels, class_to_group, num_groups)
     rc_df.to_csv(output_dir / 'rc_curve.csv', index=False)
     print(f"Saved RC curve data to {output_dir / 'rc_curve.csv'}")
@@ -105,7 +105,18 @@ def main():
     results['aurc_worst'] = aurc_wst
     print(f"AURC (Balanced): {aurc_bal:.4f}, AURC (Worst): {aurc_wst:.4f}")
 
-    # 5.2 Bootstrap CI for AURC (Balanced)
+    # 5.1.1 RC Curve and AURC (Focused range 0.2-1.0)
+    rc_df_02 = generate_rc_curve_from_02(margins, preds, test_labels, class_to_group, num_groups)
+    rc_df_02.to_csv(output_dir / 'rc_curve_02_10.csv', index=False)
+    print(f"Saved RC curve data (0.2-1.0) to {output_dir / 'rc_curve_02_10.csv'}")
+    
+    aurc_bal_02 = calculate_aurc_from_02(rc_df_02, 'balanced_error')
+    aurc_wst_02 = calculate_aurc_from_02(rc_df_02, 'worst_error')
+    results['aurc_balanced_02_10'] = aurc_bal_02
+    results['aurc_worst_02_10'] = aurc_wst_02
+    print(f"AURC 0.2-1.0 (Balanced): {aurc_bal_02:.4f}, AURC 0.2-1.0 (Worst): {aurc_wst_02:.4f}")
+
+    # 5.2 Bootstrap CI for AURC (Balanced, Full range)
     def aurc_metric_func(m, p, l):
         rc_df_boot = generate_rc_curve(m, p, l, class_to_group, num_groups, num_points=51)
         return calculate_aurc(rc_df_boot, 'balanced_error')
@@ -113,6 +124,15 @@ def main():
     mean_aurc, lower, upper = bootstrap_ci((margins, preds, test_labels), aurc_metric_func, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
     results['aurc_balanced_bootstrap'] = {'mean': mean_aurc, '95ci_lower': lower, '95ci_upper': upper}
     print(f"AURC (Balanced) Bootstrap 95% CI: [{lower:.4f}, {upper:.4f}]")
+
+    # 5.2.1 Bootstrap CI for AURC (Balanced, 0.2-1.0 range)
+    def aurc_metric_func_02(m, p, l):
+        rc_df_boot = generate_rc_curve_from_02(m, p, l, class_to_group, num_groups, num_points=41)
+        return calculate_aurc_from_02(rc_df_boot, 'balanced_error')
+
+    mean_aurc_02, lower_02, upper_02 = bootstrap_ci((margins, preds, test_labels), aurc_metric_func_02, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
+    results['aurc_balanced_02_10_bootstrap'] = {'mean': mean_aurc_02, '95ci_lower': lower_02, '95ci_upper': upper_02}
+    print(f"AURC 0.2-1.0 (Balanced) Bootstrap 95% CI: [{lower_02:.4f}, {upper_02:.4f}]")
 
     # 5.3 Metrics @ Fixed Coverage
     results_at_coverage = {}
@@ -135,7 +155,35 @@ def main():
         json.dump(results, f, indent=4)
     print(f"\nSaved all metrics to {output_dir / 'metrics.json'}")
 
-    # 7. Plot and Save RC Curve
+    # 7. Plot and Save RC Curve (Full range 0.0-1.0)
+    plt.figure(figsize=(12, 5))
+    
+    # Plot 1: Full range (0.0-1.0)
+    plt.subplot(1, 2, 1)
+    plt.plot(rc_df['coverage'], rc_df['balanced_error'], label='Balanced Error')
+    plt.plot(rc_df['coverage'], rc_df['worst_error'], label='Worst-Group Error', linestyle='--')
+    plt.xlabel('Coverage')
+    plt.ylabel('Selective Risk (Error)')
+    plt.title(f'Risk-Coverage Curve (Full Range)\n{CONFIG["model_name"]}')
+    plt.grid(True, linestyle=':')
+    plt.legend()
+    
+    # Plot 2: Focused range (0.2-1.0)
+    plt.subplot(1, 2, 2)
+    plt.plot(rc_df_02['coverage'], rc_df_02['balanced_error'], label='Balanced Error')
+    plt.plot(rc_df_02['coverage'], rc_df_02['worst_error'], label='Worst-Group Error', linestyle='--')
+    plt.xlabel('Coverage')
+    plt.ylabel('Selective Risk (Error)')
+    plt.title(f'Risk-Coverage Curve (0.2-1.0)\n{CONFIG["model_name"]}')
+    plt.grid(True, linestyle=':')
+    plt.legend()
+    plt.xlim(0.2, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'rc_curve_comparison.png', dpi=300, bbox_inches='tight')
+    print(f"Saved RC curve comparison plot to {output_dir / 'rc_curve_comparison.png'}")
+    
+    # Also save individual plots for backward compatibility
     plt.figure()
     plt.plot(rc_df['coverage'], rc_df['balanced_error'], label='Balanced Error')
     plt.plot(rc_df['coverage'], rc_df['worst_error'], label='Worst-Group Error', linestyle='--')
@@ -146,6 +194,19 @@ def main():
     plt.legend()
     plt.savefig(output_dir / 'rc_curve.png')
     print(f"Saved RC curve plot to {output_dir / 'rc_curve.png'}")
+    
+    # Save focused range plot separately
+    plt.figure()
+    plt.plot(rc_df_02['coverage'], rc_df_02['balanced_error'], label='Balanced Error')
+    plt.plot(rc_df_02['coverage'], rc_df_02['worst_error'], label='Worst-Group Error', linestyle='--')
+    plt.xlabel('Coverage')
+    plt.ylabel('Selective Risk (Error)')
+    plt.title(f'Risk-Coverage Curve (0.2-1.0) for {CONFIG["model_name"]}')
+    plt.grid(True, linestyle=':')
+    plt.legend()
+    plt.xlim(0.2, 1.0)
+    plt.savefig(output_dir / 'rc_curve_02_10.png')
+    print(f"Saved RC curve (0.2-1.0) plot to {output_dir / 'rc_curve_02_10.png'}")
 
 if __name__ == '__main__':
     main()

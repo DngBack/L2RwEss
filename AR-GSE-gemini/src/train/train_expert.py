@@ -35,7 +35,7 @@ CONFIG = {
         'lr': 0.4,             # LR cao theo baseline
         'momentum': 0.9,
         'weight_decay': 1e-4,  # Weight decay theo baseline
-        'warmup_steps': 15,    ## CẬP NHẬT: Thêm warmup
+        'warmup_steps': 30,    ## CẬP NHẬT: Thêm warmup
     },
     'output': {
         'checkpoints_dir': './checkpoints/experts',
@@ -50,14 +50,17 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 def get_dataloaders(config):
     # Dataloaders for training and calibration
     transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
+        transforms.RandAugment(num_ops=2, magnitude=10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.4),
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4867, 0.4408),
                             (0.2675, 0.2565, 0.2761)),
     ])
 
     transform_test = transforms.Compose([
+        transforms.CenterCrop(32),
         transforms.ToTensor(),
         transforms.Normalize((0.5071, 0.4867, 0.4408),
                             (0.2675, 0.2565, 0.2761)),

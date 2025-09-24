@@ -28,10 +28,10 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balance',
+        'mode': 'balanced',
         'epochs': 100,
         'batch_size': 256,
-        'c': 0.8,  # Increase coverage requirement to encourage acceptance
+        'c': 0.2,  # Increase coverage requirement to encourage acceptance
         'alpha_clip': 1e-2,  # Increase minimum alpha
         'lambda_ent': 1e-2,  # Increase entropy regularization
     },
@@ -49,7 +49,7 @@ CONFIG = {
         'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse_balance',
+        'checkpoints_dir': './checkpoints/argse_worst/',
     },
     'seed': 42
 }
