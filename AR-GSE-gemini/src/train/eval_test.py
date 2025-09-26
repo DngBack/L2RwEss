@@ -2,7 +2,6 @@ import torch
 import torchvision
 import numpy as np
 import json
-import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 

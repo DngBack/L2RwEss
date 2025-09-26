@@ -14,41 +14,60 @@ def create_longtail_val_test_splits(
     seed: int = 42
 ):
     """
-    Tạo ra tập validation và test có phân phối long-tail từ tập test cân bằng gốc.
+    Creates val/test splits with long-tail distribution matching train distribution.
+    Follows paper methodology: re-sample original test to match train-LT proportions.
     """
     print("\nCreating long-tail validation and test sets...")
     test_targets = np.array(cifar100_test_dataset.targets)
     num_classes = len(train_class_counts)
     
-    # Số lượng mẫu tối đa cho mỗi lớp trong tập test gốc là 100
-    max_samples_per_class_test = 100
+    # Calculate train-LT class proportions
+    total_train_samples = sum(train_class_counts)
+    train_proportions = [count / total_train_samples for count in train_class_counts]
     
+    # Original test size (CIFAR-100 has 100 samples per class = 10k total)
+    original_test_size = len(test_targets)
+    
+    # Calculate target counts for each class in test-LT
+    # We want to match train proportions, but limited by available test samples
+    target_test_counts = []
+    for i in range(num_classes):
+        target_count = int(round(train_proportions[i] * original_test_size))
+        # Can't exceed 100 samples per class (original CIFAR test limit)
+        target_count = min(target_count, 100)
+        target_test_counts.append(target_count)
+    
+    print(f"Target test-LT distribution:")
+    print(f"  Head class: {target_test_counts[0]} samples")
+    print(f"  Tail class: {target_test_counts[-1]} samples")
+    
+    # Re-sample from original test to create test-LT pool
     lt_test_pool_indices = []
     
-    # Subsample tập test gốc để khớp với phân phối của tập train
     for i in range(num_classes):
-        # Số lượng mẫu cần lấy cho lớp i phải nhỏ hơn hoặc bằng số lượng trong tập train
-        # và không được vượt quá số lượng có sẵn trong tập test (100)
-        num_samples_to_take = min(train_class_counts[i], max_samples_per_class_test)
-        
         class_indices_in_test = np.where(test_targets == i)[0]
+        num_samples_to_take = target_test_counts[i]
         
-        # Lấy ngẫu nhiên các chỉ số từ tập test
-        sampled_indices = np.random.choice(class_indices_in_test, num_samples_to_take, replace=False)
-        lt_test_pool_indices.extend(sampled_indices)
+        if num_samples_to_take > 0:
+            # Randomly sample without replacement  
+            sampled_indices = np.random.choice(
+                class_indices_in_test, 
+                num_samples_to_take, 
+                replace=False
+            )
+            lt_test_pool_indices.extend(sampled_indices)
         
     lt_test_pool_indices = np.array(lt_test_pool_indices)
-    lt_test_pool_targets = test_targets[lt_test_pool_indices]
     
-    print(f"Created a long-tail pool from test set with {len(lt_test_pool_indices)} samples.")
+    print(f"Created LT test pool with {len(lt_test_pool_indices)} samples")
     
-    # Chia pool này thành 20% validation và 80% test
-    val_indices, test_indices = train_test_split(
-        lt_test_pool_indices,
-        test_size=1.0 - val_size,
-        random_state=seed,
-        stratify=lt_test_pool_targets
-    )
+    # Split the LT test pool: 20% val, 80% test  
+    # Important: Do NOT use stratify here - we want to maintain LT distribution
+    np.random.shuffle(lt_test_pool_indices)  # Random shuffle
+    n_val = int(round(val_size * len(lt_test_pool_indices)))
+    
+    val_indices = lt_test_pool_indices[:n_val]
+    test_indices = lt_test_pool_indices[n_val:]
     
     splits = {
         'val_lt': val_indices.tolist(),

@@ -5,8 +5,8 @@ from typing import List, Tuple
 
 def get_cifar100_lt_counts(imb_factor: int = 100, num_classes: int = 100) -> List[int]:
     """
-    Generates class sample counts for CIFAR-100-LT.
-    Follows the standard exponential decay rule.
+    Generates class sample counts for CIFAR-100-LT using exponential profile.
+    Follows Cao et al., 2019 standard.
 
     Args:
         imb_factor: Imbalance factor, e.g., 100 means the most frequent class
@@ -14,16 +14,16 @@ def get_cifar100_lt_counts(imb_factor: int = 100, num_classes: int = 100) -> Lis
         num_classes: Number of classes, 100 for CIFAR-100.
 
     Returns:
-        A list of sample counts per class.
+        A list of sample counts per class (head->tail order).
     """
     # Original CIFAR-100 has 500 samples per class in the training set
     img_max = 500.0
-    img_min = img_max / imb_factor
     
     counts = []
     for cls_idx in range(num_classes):
-        num = img_max * (img_min / img_max) ** (cls_idx / (num_classes - 1.0))
-        counts.append(int(num))
+        # Correct exponential profile: n_i = n_max * (IF)^(-i/(C-1))
+        num = img_max * (imb_factor ** (-cls_idx / (num_classes - 1.0)))
+        counts.append(max(1, int(num)))  # Ensure at least 1 sample per class
         
     return counts
 
@@ -58,20 +58,26 @@ def generate_longtail_train_set(cifar100_train_dataset, imb_factor: int = 100) -
         
     lt_indices = np.array(lt_indices)
     lt_targets = targets[lt_indices]
-    
+
+    print("Created CIFAR-100-LT train set:")
+    print(f"  Total samples: {len(lt_indices)}")
+    print(f"  Head class count: {target_counts[0]}")  
+    print(f"  Tail class count: {target_counts[-1]}")
+    print(f"  Imbalance factor: {target_counts[0] / target_counts[-1]:.1f}")
+
     return lt_indices, lt_targets
+
 
 # Data augmentations for CIFAR-100
 
 def get_train_augmentations():
     """
-    Get training augmentations for CIFAR-100.
-    Includes standard augmentations commonly used in long-tail learning.
+    Get training augmentations for CIFAR-100 following paper specifications.
+    Uses only basic augmentations as per Menon et al., 2021a.
     """
     return transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.5071, 0.4867, 0.4408],  # CIFAR-100 mean
