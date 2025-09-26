@@ -21,7 +21,7 @@ EXPERT_CONFIGS = {
     'ce': {
         'name': 'ce_baseline',
         'loss_type': 'ce',
-        'epochs': 200,
+        'epochs': 256,
         'lr': 0.1,
         'weight_decay': 1e-4,
         'milestones': [96, 192, 224],  # For MultiStepLR
@@ -30,18 +30,18 @@ EXPERT_CONFIGS = {
     'logitadjust': {
         'name': 'logitadjust_baseline', 
         'loss_type': 'logitadjust',
-        'epochs': 200,
+        'epochs': 256,
         'lr': 0.1,
-        'weight_decay': 2e-4,  # Slightly higher regularization for imbalanced data
-        'milestones': [96, 192, 224],
+        'weight_decay': 5e-4,  # Slightly higher regularization for imbalanced data
+        'milestones': [160/180],
         'gamma': 0.1
     },
     'balsoftmax': {
         'name': 'balsoftmax_baseline',
         'loss_type': 'balsoftmax', 
-        'epochs': 200,
+        'epochs': 256,
         'lr': 0.1,
-        'weight_decay': 2e-4,
+        'weight_decay': 5e-4,
         'milestones': [96, 192, 224],
         'gamma': 0.1
     }
@@ -284,8 +284,8 @@ def train_single_expert(expert_key):
         val_acc, group_accs = validate_model(model, val_loader, DEVICE)
         
         print(f"Epoch {epoch+1:3d}: Loss={running_loss/len(train_loader):.4f}, "
-              f"Val Acc={val_acc:.2f}%, Head={group_accs['head']:.1f}%, "
-              f"Tail={group_accs['tail']:.1f}%, LR={scheduler.get_last_lr()[0]:.5f}")
+            f"Val Acc={val_acc:.2f}%, Head={group_accs['head']:.1f}%, "
+            f"Tail={group_accs['tail']:.1f}%, LR={scheduler.get_last_lr()[0]:.5f}")
         
         # Save best model
         if val_acc > best_acc:
@@ -308,8 +308,8 @@ def train_single_expert(expert_key):
     # Final validation
     final_acc, final_group_accs = validate_model(model, val_loader, DEVICE)
     print(f"📊 Final Results - Overall: {final_acc:.2f}%, "
-          f"Head: {final_group_accs['head']:.1f}%, "
-          f"Tail: {final_group_accs['tail']:.1f}%")
+        f"Head: {final_group_accs['head']:.1f}%, "
+        f"Tail: {final_group_accs['tail']:.1f}%")
     
     # Export logits
     export_logits_for_all_splits(model, expert_name)

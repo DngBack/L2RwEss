@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 
 class TemperatureScaler:
     def __init__(self):
