@@ -42,18 +42,15 @@ class AR_GSE(nn.Module):
         gating_raw_weights = self.gating_net(gating_features)
         w = F.softmax(gating_raw_weights, dim=1) # Shape [B, E]
 
-        # 2. Apply temperature scaling to expert logits before mixture
-        # Temperature scaling helps with calibration (typical temperature ~2-4)
-        temperature = 2.0  # Reduce temperature for less conservative predictions
-        expert_logits_scaled = expert_logits / temperature
+        # 2. Convert expert LOGITS to POSTERIORS (η̃_y(x) should be probabilities)
+        # Note: expert_logits are pre-computed calibrated logits from experts
+        expert_posteriors = F.softmax(expert_logits, dim=-1)  # [B, E, C]
         
-        # 3. Mixture with temperature-scaled logits
-        expert_posteriors = F.softmax(expert_logits_scaled, dim=-1)
-        # einops is great for this: b e c -> b c
-        eta_mix = torch.einsum('be,bec->bc', w, expert_posteriors)
-        eta_mix = torch.clamp(eta_mix, min=1e-8) # for stability
+        # 3. Mixture of expert posteriors: η̃_y(x) = Σ_e w^(e)(x) * p^(e)(y|x)
+        eta_mix = torch.einsum('be,bec->bc', w, expert_posteriors)  # [B, C]
+        eta_mix = torch.clamp(eta_mix, min=1e-8, max=1.0-1e-8)  # Stability + valid probabilities
 
-        # 3. Margin & Acceptance Probability
+        # 4. Margin & Acceptance Probability
         margin = self.selective_margin(eta_mix, c, class_to_group)
         s_tau = torch.sigmoid(tau * margin)
 

@@ -33,7 +33,7 @@ EXPERT_CONFIGS = {
         'epochs': 256,
         'lr': 0.1,
         'weight_decay': 5e-4,  # Slightly higher regularization for imbalanced data
-        'milestones': [160/180],
+        'milestones': [160,180],
         'gamma': 0.1
     },
     'balsoftmax': {
@@ -172,9 +172,12 @@ def export_logits_for_all_splits(model, expert_name):
         # From training set
         {'name': 'train', 'dataset_type': 'train', 'file': 'train_indices.json'},
         {'name': 'tuneV', 'dataset_type': 'train', 'file': 'tuneV_indices.json'},
-        # From test set
+        {'name': 'val_small', 'dataset_type': 'train', 'file': 'val_small_indices.json'},
+        # From test set  
         {'name': 'val_lt', 'dataset_type': 'test', 'file': 'val_lt_indices.json'},
         {'name': 'test_lt', 'dataset_type': 'test', 'file': 'test_lt_indices.json'},
+        # Additional: calib split for CRC (if exists)
+        {'name': 'calib', 'dataset_type': 'train', 'file': 'calib_indices.json'},
     ]
     
     for split_info in splits_info:

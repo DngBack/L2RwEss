@@ -21,8 +21,8 @@ CONFIG = {
         'splits_dir': './data/cifar100_lt_if100_splits', ## CẬP NHẬT: Đường dẫn tới split
         'num_classes': 100,
     },
-    'model_name': 'argse_worst', # or 'argse_worst'
-    'checkpoint_path': './checkpoints/argse_worst/cifar100_lt_if100/argse_worst.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
+    'model_name': 'argse_balanced', # or 'argse_worst'
+    'checkpoint_path': './checkpoints/argse_balanced/cifar100_lt_if100/argse_balanced.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
     'experts': {
         # Cập nhật tên expert cho khớp với M2 mới
         'names': ['ce_baseline','logitadjust_baseline', 'balsoftmax_baseline'], #, 'logitadjust_baseline', 'balsoftmax_baseline'],
@@ -33,7 +33,7 @@ CONFIG = {
         'bootstrap_n': 1000,
         'bootstrap_ci': 0.95,
     },
-    'output_dir': './results_balance/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
+    'output_dir': './results_balanced/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
     'seed': 42
 }
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'

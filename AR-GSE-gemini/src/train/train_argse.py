@@ -28,7 +28,7 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'worst',  # 'balanced' hoặc 'worst'
+        'mode': 'balanced',  # 'balanced' hoặc 'worst'
         'epochs': 100,
         'batch_size': 256,
         'c': 0.2,  # Increase coverage requirement to encourage acceptance
@@ -36,9 +36,9 @@ CONFIG = {
         'lambda_ent': 1e-2,  # Increase entropy regularization
     },
     'optimizers': {
-        'phi_lr': 1e-3,       # Increase gating network learning rate
-        'alpha_mu_lr': 5e-3,  # Increase threshold learning rate
-        'rho': 1e-2,          # Increase dual variable update rate
+        'phi_lr': 1e-3,       # Gating network learning rate  
+        'alpha_mu_lr': 1e-3,  # More conservative threshold learning rate (was 5e-3)
+        'rho': 3e-3,          # More conservative dual variable update rate (was 1e-2)
     },
     'scheduler': {
         'tau_start': 1.0,     # Start with lower temperature
@@ -49,7 +49,7 @@ CONFIG = {
         'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse_worst/',
+        'checkpoints_dir': './checkpoints/argse_balanced/',
     },
     'seed': 42
 }
@@ -59,7 +59,8 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def load_data_from_logits(config):
     """
-    Loads pre-computed logits and labels for tuneV and val_small splits.
+    Loads pre-computed logits and labels for tuneV and val_lt splits.
+    Fixed: Use available logits files from expert training.
     """
     logits_root = Path(config['experts']['logits_dir']) / config['dataset']['name']
     splits_dir = Path(config['dataset']['splits_dir'])
@@ -69,31 +70,48 @@ def load_data_from_logits(config):
     
     dataloaders = {}
     
-    # We need original labels to create datasets
-    # Load from the full original training dataset
+    # Load datasets based on available splits
     cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
     
-    for split in ['tuneV', 'val_small']:
-        print(f"Loading data for split: {split}")
+    # Use tuneV for training (from train split) and val_lt for validation (from test split)
+    splits_config = [
+        {'split_name': 'tuneV', 'base_dataset': cifar_train_full, 'indices_file': 'tuneV_indices.json'},
+        {'split_name': 'val_lt', 'base_dataset': cifar_test_full, 'indices_file': 'val_lt_indices.json'}
+    ]
+    
+    for split_config in splits_config:
+        split_name = split_config['split_name']
+        base_dataset = split_config['base_dataset'] 
+        indices_file = split_config['indices_file']
+        
+        print(f"Loading data for split: {split_name}")
         
         # Load indices for the split
-        with open(splits_dir / f"{split}_indices.json", 'r') as f:
+        indices_path = splits_dir / indices_file
+        if not indices_path.exists():
+            raise FileNotFoundError(f"Missing indices file: {indices_path}")
+            
+        with open(indices_path, 'r') as f:
             indices = json.load(f)
         
-        # Load logits from each expert and stack them
+        # Load pre-computed LOGITS from each expert
         stacked_logits = torch.zeros(len(indices), num_experts, num_classes)
         for i, expert_name in enumerate(expert_names):
-            logits_path = logits_root / expert_name / f"{split}_logits.pt"
+            logits_path = logits_root / expert_name / f"{split_name}_logits.pt"
+            if not logits_path.exists():
+                raise FileNotFoundError(f"Missing logits file: {logits_path}")
             stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
 
-        # Get corresponding labels
-        labels = torch.tensor(np.array(cifar_train_full.targets)[indices])
+        # Get corresponding labels from base dataset
+        labels = torch.tensor(np.array(base_dataset.targets)[indices])
         
-        dataset = TensorDataset(stacked_logits, labels)
-        dataloader = DataLoader(dataset, batch_size=config['argse_params']['batch_size'], shuffle=(split=='tuneV'), num_workers=4)
-        dataloaders[split] = dataloader
+        dataset = TensorDataset(stacked_logits, labels)  # Note: stacked_logits are LOGITS
+        dataloader = DataLoader(dataset, batch_size=config['argse_params']['batch_size'], 
+                               shuffle=(split_name=='tuneV'), num_workers=4)
+        dataloaders[split_name] = dataloader
 
-    return dataloaders['tuneV'], dataloaders['val_small']
+    return dataloaders['tuneV'], dataloaders['val_lt']
 
 def update_beta_eg(current_beta, group_errors, xi):
     """Updates group cost weights using Exponentiated Gradient."""
@@ -120,8 +138,10 @@ def eval_epoch(model, loader, c, class_to_group):
             # Forward pass to get margin
             outputs = model(logits, c, 1.0, class_to_group)
             
-            # Get prediction using re-weighted scores: h_α(x) = argmax_y α_{grp(y)} * η̃_y(x)
+            # Get prediction using re-weighted posterior: h_α(x) = argmax_y α_{grp(y)} * η̃_y(x)  
+            # Note: η̃_y(x) is POSTERIOR, not logits!
             alpha = model.alpha.to(logits.device)
+            class_to_group = class_to_group.to(logits.device)
             reweighted_scores = alpha[class_to_group] * outputs['eta_mix']  # [B, C]
             _, preds = torch.max(reweighted_scores, 1)
             
@@ -181,8 +201,10 @@ def main():
     torch.manual_seed(CONFIG['seed'])
     np.random.seed(CONFIG['seed'])
 
-    # 1. Load Data
+    # 1. Load Data - using tuneV (train) and val_lt (validation)
     train_loader, val_loader = load_data_from_logits(CONFIG)
+    print(f"✅ Loaded training data: {len(train_loader)} batches")
+    print(f"✅ Loaded validation data: {len(val_loader)} batches")
     
     # 2. Get class/group info
     class_counts = get_cifar100_lt_counts(imb_factor=100) # Assuming IF=100 from M1
