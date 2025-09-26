@@ -5,6 +5,7 @@ Visualize CIFAR-100-LT dataset distributions from head to tail classes.
 """
 
 import json
+import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import Counter
