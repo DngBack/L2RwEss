@@ -28,7 +28,7 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balanced',  # 'balanced' hoặc 'worst'
+        'mode': 'worst',  # 'balanced' hoặc 'worst' - CHANGED TO WORST-GROUP MODE
         'epochs': 100,
         'batch_size': 256,
         'c': 0.2,  # Increase coverage requirement to encourage acceptance
@@ -46,10 +46,13 @@ CONFIG = {
         'tau_warmup_epochs': 20,  # Slower warmup
     },
     'worst_group_params': {
-        'eg_xi': 1.0, # Tốc độ học của Exponentiated Gradient
+        'eg_xi': 0.1,  # More conservative step-size as per paper recommendations
+        'beta_momentum': 0.0,  # Pure EG algorithm (no momentum)
+        'min_beta': 0.1,  # Minimum group weight to prevent extreme imbalance
+        'max_beta': 0.9,  # Maximum group weight
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse_balanced/',
+        'checkpoints_dir': './checkpoints/argse_worst/',  # Changed to worst-group directory
     },
     'seed': 42
 }
@@ -71,8 +74,8 @@ def load_data_from_logits(config):
     dataloaders = {}
     
     # Load datasets based on available splits
-    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
-    cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=True)
+    cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=True)
     
     # Use tuneV for training (from train split) and val_lt for validation (from test split)
     splits_config = [
@@ -104,7 +107,7 @@ def load_data_from_logits(config):
             stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
 
         # Get corresponding labels from base dataset
-        labels = torch.tensor(np.array(base_dataset.targets)[indices])
+        labels = torch.tensor(np.array(base_dataset.targets)[indices], dtype=torch.long)
         
         dataset = TensorDataset(stacked_logits, labels)  # Note: stacked_logits are LOGITS
         dataloader = DataLoader(dataset, batch_size=config['argse_params']['batch_size'], 
@@ -113,15 +116,46 @@ def load_data_from_logits(config):
 
     return dataloaders['tuneV'], dataloaders['val_lt']
 
-def update_beta_eg(current_beta, group_errors, xi):
-    """Updates group cost weights using Exponentiated Gradient."""
+def update_beta_eg(current_beta, group_errors, xi, momentum=0.0, min_beta=0.1, max_beta=0.9):
+    """
+    Stabilized Exponentiated Gradient update for worst-group optimization.
+    Implements Algorithm 2 from the paper with regularization.
+    
+    Args:
+        current_beta: Current group weights [num_groups]
+        group_errors: Per-group error estimates [num_groups] 
+        xi: EG step-size ξ (learning rate)
+        momentum: Momentum factor (set to 0 for pure EG)
+        min_beta: Minimum beta value to prevent extreme imbalance
+        max_beta: Maximum beta value to prevent one group dominating
+        
+    Returns:
+        Updated beta weights following EG update rule
+    """
     # Ensure group_errors is a tensor
     if isinstance(group_errors, list):
-        group_errors = torch.tensor(group_errors, device=current_beta.device)
+        group_errors = torch.tensor(group_errors, device=current_beta.device, dtype=current_beta.dtype)
     
-    # EG update rule
-    new_beta = current_beta * torch.exp(xi * group_errors)
-    return new_beta / new_beta.sum()
+    # Clip errors to reasonable range to prevent numerical instability
+    group_errors = torch.clamp(group_errors, 0.0, 1.0)
+    
+    # EG update rule: β_k ← (β_k * exp(ξ * ê_k)) / Σ_j β_j * exp(ξ * ê_j)
+    exp_errors = torch.exp(xi * group_errors)  # exp(ξ * ê_k)
+    numerator = current_beta * exp_errors  # β_k * exp(ξ * ê_k)
+    denominator = torch.sum(current_beta * exp_errors)  # Σ_j β_j * exp(ξ * ê_j)
+    
+    new_beta = numerator / denominator
+    
+    # Apply momentum if specified
+    if momentum > 0:
+        new_beta = momentum * current_beta + (1 - momentum) * new_beta
+        new_beta = new_beta / new_beta.sum()
+    
+    # Regularize to prevent extreme weights (important for stability)
+    new_beta = torch.clamp(new_beta, min_beta, max_beta)
+    new_beta = new_beta / new_beta.sum()  # Re-normalize
+    
+    return new_beta
 
 def eval_epoch(model, loader, c, class_to_group):
     """Evaluates the model with hard rejection decisions. (Phiên bản đã sửa lỗi device)"""
@@ -280,8 +314,15 @@ def main():
 
         # Update beta for worst-group mode
         if CONFIG['argse_params']['mode'] == 'worst':
-            beta = update_beta_eg(beta, val_metrics['group_errors'], CONFIG['worst_group_params']['eg_xi'])
-            print(f"Updated Beta: {[f'{b:.3f}' for b in beta.tolist()]}")
+            beta = update_beta_eg(
+                beta, 
+                val_metrics['group_errors'], 
+                CONFIG['worst_group_params']['eg_xi'],
+                momentum=CONFIG['worst_group_params']['beta_momentum'],
+                min_beta=CONFIG['worst_group_params']['min_beta'],
+                max_beta=CONFIG['worst_group_params']['max_beta']
+            )
+            print(f"EG ξ={CONFIG['worst_group_params']['eg_xi']:.2f} | Beta: {[f'{b:.3f}' for b in beta.tolist()]} | Group Errors: {[f'{e:.3f}' for e in val_metrics['group_errors']]}")
 
         # Update tau (warm-up)
         if epoch < CONFIG['scheduler']['tau_warmup_epochs']:

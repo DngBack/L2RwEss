@@ -17,7 +17,9 @@ def selective_cls_loss(
     """
     # Get group for each sample in the batch
     # All input tensors are already on the correct device.
-    sample_groups = class_to_group[y_true]
+    # Ensure y_true is Long type for indexing
+    y_true_long = y_true.long()
+    sample_groups = class_to_group[y_true_long]
     
     # Get the cost weight for each sample
     sample_beta = beta[sample_groups]
@@ -25,9 +27,9 @@ def selective_cls_loss(
 
     # Calculate the per-sample classification loss
     if kind == "ce":
-        per_sample_loss = F.cross_entropy(eta_mix, y_true, reduction='none')
+        per_sample_loss = F.cross_entropy(eta_mix, y_true_long, reduction='none')
     elif kind == "one_minus_p":
-        p_true = eta_mix.gather(1, y_true.unsqueeze(1)).squeeze()
+        p_true = eta_mix.gather(1, y_true_long.unsqueeze(1)).squeeze()
         per_sample_loss = 1 - p_true
     else:
         raise ValueError(f"Unknown loss kind: {kind}")

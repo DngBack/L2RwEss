@@ -21,8 +21,8 @@ CONFIG = {
         'splits_dir': './data/cifar100_lt_if100_splits', ## CẬP NHẬT: Đường dẫn tới split
         'num_classes': 100,
     },
-    'model_name': 'argse_balanced', # or 'argse_worst'
-    'checkpoint_path': './checkpoints/argse_balanced/cifar100_lt_if100/argse_balanced.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
+    'model_name': 'argse_worst', # Changed to worst-group mode
+    'checkpoint_path': './checkpoints/argse_worst/cifar100_lt_if100/argse_worst.ckpt', ## Updated checkpoint path
     'experts': {
         # Cập nhật tên expert cho khớp với M2 mới
         'names': ['ce_baseline','logitadjust_baseline', 'balsoftmax_baseline'], #, 'logitadjust_baseline', 'balsoftmax_baseline'],
@@ -33,7 +33,7 @@ CONFIG = {
         'bootstrap_n': 1000,
         'bootstrap_ci': 0.95,
     },
-    'output_dir': './results_balanced/cifar100_lt_if100', ## CẬP NHẬT: Đường dẫn output
+    'output_dir': './results_worst/cifar100_lt_if100', ## Updated output path for worst-group results
     'seed': 42
 }
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -75,7 +75,7 @@ def main():
             raise FileNotFoundError(f"Logits file not found for expert '{expert_name}': {logits_path}. Please run M2 expert training first.")
         stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
     
-    full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+    full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True)
     test_labels = torch.tensor(np.array(full_test_dataset.targets)[test_indices])
 
     print(f"Successfully loaded {num_test_samples} samples for long-tail test set.")
