@@ -7,7 +7,7 @@ from pathlib import Path
 
 # Import our custom modules
 from src.models.argse import AR_GSE
-from src.data.groups import get_class_to_group
+from src.data.groups import get_class_to_group_by_threshold
 from src.data.datasets import get_cifar100_lt_counts
 from src.metrics.selective_metrics import calculate_selective_errors
 from src.metrics.rc_curve import generate_rc_curve, generate_rc_curve_from_02, calculate_aurc, calculate_aurc_from_02
@@ -21,7 +21,7 @@ CONFIG = {
         'splits_dir': './data/cifar100_lt_if100_splits', ## CẬP NHẬT: Đường dẫn tới split
         'num_classes': 100,
     },
-    'model_name': 'argse_balanced', # or 'argse_worst'
+    'model_name': 'argse_balanced', # 'argse_worst' or 'argse_balanced' ## CẬP NHẬT: Tên model
     'checkpoint_path': './checkpoints/argse_balanced/cifar100_lt_if100/argse_balanced.ckpt', ## CẬP NHẬT: Đường dẫn checkpoint
     'experts': {
         # Cập nhật tên expert cho khớp với M2 mới
@@ -47,8 +47,8 @@ def main():
 
     # 1. Load Group Info
     class_counts = get_cifar100_lt_counts(imb_factor=100)
-    ## CẬP NHẬT: Giữ class_to_group trên CPU vì tất cả các hàm metrics đều chạy trên CPU
-    class_to_group = get_class_to_group(class_counts, K=2, head_ratio=0.5)
+    ## CẬP NHẬT: Sử dụng hàm get_class_to_group_by_threshold với threshold thay vì head_ratio
+    class_to_group = get_class_to_group_by_threshold(class_counts, threshold=20)
     num_groups = class_to_group.max().item() + 1
     
     # 2. Load Model
@@ -83,9 +83,10 @@ def main():
     # 4. Get Model Predictions on Test Set
     with torch.no_grad():
         # Chuyển class_to_group sang GPU chỉ cho bước forward này
-        outputs = model(stacked_logits.to(DEVICE), c=0.2, tau=10.0, class_to_group=class_to_group.to(DEVICE))
+        outputs = model(stacked_logits.to(DEVICE), c=0.7, tau=10.0, class_to_group=class_to_group.to(DEVICE))
     
-    margins = outputs['margin'].cpu()
+    margins_point = outputs['margin'].cpu()        # margin with c subtracted (for point metrics)
+    margins_raw = outputs['raw_margin'].cpu()      # raw margin without c (for RC curve)
     eta_mix = outputs['eta_mix'].cpu()
     
     # Use re-weighted prediction: h_α(x) = argmax_y α_{grp(y)} * η̃_y(x)
@@ -98,8 +99,8 @@ def main():
     results = {}
     print("\nCalculating metrics...")
 
-    # 5.1 RC Curve and AURC (Full range 0.0-1.0)
-    rc_df = generate_rc_curve(margins, preds, test_labels, class_to_group, num_groups)
+    # 5.1 RC Curve and AURC (Full range 0.0-1.0) - Using RAW MARGIN for fair comparison with paper
+    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group, num_groups)
     rc_df.to_csv(output_dir / 'rc_curve.csv', index=False)
     print(f"Saved RC curve data to {output_dir / 'rc_curve.csv'}")
     
@@ -109,8 +110,8 @@ def main():
     results['aurc_worst'] = aurc_wst
     print(f"AURC (Balanced): {aurc_bal:.4f}, AURC (Worst): {aurc_wst:.4f}")
 
-    # 5.1.1 RC Curve and AURC (Focused range 0.2-1.0)
-    rc_df_02 = generate_rc_curve_from_02(margins, preds, test_labels, class_to_group, num_groups)
+    # 5.1.1 RC Curve and AURC (Focused range 0.2-1.0) - Using RAW MARGIN
+    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group, num_groups)
     rc_df_02.to_csv(output_dir / 'rc_curve_02_10.csv', index=False)
     print(f"Saved RC curve data (0.2-1.0) to {output_dir / 'rc_curve_02_10.csv'}")
     
@@ -120,36 +121,45 @@ def main():
     results['aurc_worst_02_10'] = aurc_wst_02
     print(f"AURC 0.2-1.0 (Balanced): {aurc_bal_02:.4f}, AURC 0.2-1.0 (Worst): {aurc_wst_02:.4f}")
 
-    # 5.2 Bootstrap CI for AURC (Balanced, Full range)
-    def aurc_metric_func(m, p, l):
-        rc_df_boot = generate_rc_curve(m, p, l, class_to_group, num_groups, num_points=51)
+    # 5.2 Bootstrap CI for AURC (Balanced, Full range) - Using RAW MARGIN
+    def aurc_metric_func(m, p, labels):
+        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group, num_groups, num_points=51)
         return calculate_aurc(rc_df_boot, 'balanced_error')
 
-    mean_aurc, lower, upper = bootstrap_ci((margins, preds, test_labels), aurc_metric_func, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
+    mean_aurc, lower, upper = bootstrap_ci((margins_raw, preds, test_labels), aurc_metric_func, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
     results['aurc_balanced_bootstrap'] = {'mean': mean_aurc, '95ci_lower': lower, '95ci_upper': upper}
     print(f"AURC (Balanced) Bootstrap 95% CI: [{lower:.4f}, {upper:.4f}]")
 
-    # 5.2.1 Bootstrap CI for AURC (Balanced, 0.2-1.0 range)
-    def aurc_metric_func_02(m, p, l):
-        rc_df_boot = generate_rc_curve_from_02(m, p, l, class_to_group, num_groups, num_points=41)
+    # 5.2.1 Bootstrap CI for AURC (Balanced, 0.2-1.0 range) - Using RAW MARGIN
+    def aurc_metric_func_02(m, p, labels):
+        rc_df_boot = generate_rc_curve_from_02(m, p, labels, class_to_group, num_groups, num_points=41)
         return calculate_aurc_from_02(rc_df_boot, 'balanced_error')
 
-    mean_aurc_02, lower_02, upper_02 = bootstrap_ci((margins, preds, test_labels), aurc_metric_func_02, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
+    mean_aurc_02, lower_02, upper_02 = bootstrap_ci((margins_raw, preds, test_labels), aurc_metric_func_02, n_bootstraps=CONFIG['eval_params']['bootstrap_n'])
     results['aurc_balanced_02_10_bootstrap'] = {'mean': mean_aurc_02, '95ci_lower': lower_02, '95ci_upper': upper_02}
     print(f"AURC 0.2-1.0 (Balanced) Bootstrap 95% CI: [{lower_02:.4f}, {upper_02:.4f}]")
 
-    # 5.3 Metrics @ Fixed Coverage
+    # 5.3 Metrics @ Fixed Coverage - Using RAW MARGIN for fair comparison
     results_at_coverage = {}
     for cov_target in CONFIG['eval_params']['coverage_points']:
-        threshold = torch.quantile(margins, 1.0 - cov_target)
-        accepted_mask = margins >= threshold
+        threshold = torch.quantile(margins_raw, 1.0 - cov_target)
+        accepted_mask = margins_raw >= threshold
         
         metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group, num_groups)
         results_at_coverage[f'cov_{cov_target}'] = metrics
         print(f"Metrics @ {metrics['coverage']:.2f} coverage: Bal. Err={metrics['balanced_error']:.4f}, Worst Err={metrics['worst_error']:.4f}")
     results['metrics_at_coverage'] = results_at_coverage
 
-    # 5.4 Calibration (ECE)
+    # 5.4 Point metrics at training c (AR-GSE specific evaluation)
+    accepted_mask_point = margins_point >= 0   # reject rule already includes c
+    metrics_point = calculate_selective_errors(preds, test_labels, accepted_mask_point, class_to_group, num_groups)
+    results['metrics_point_c_train'] = metrics_point
+    print("\n=== AR-GSE Point Metrics @ c_train ===")
+    print(f"Coverage={metrics_point['coverage']:.3f}, "
+          f"Bal.Err={metrics_point['balanced_error']:.4f}, "
+          f"Worst.Err={metrics_point['worst_error']:.4f}")
+
+    # 5.5 Calibration (ECE)
     ece = calculate_ece(eta_mix, test_labels)
     results['ece'] = ece
     print(f"Expected Calibration Error (ECE): {ece:.4f}")
@@ -211,6 +221,21 @@ def main():
     plt.xlim(0.2, 1.0)
     plt.savefig(output_dir / 'rc_curve_02_10.png')
     print(f"Saved RC curve (0.2-1.0) plot to {output_dir / 'rc_curve_02_10.png'}")
+    
+    # Summary of evaluation approach
+    print("\n" + "="*60)
+    print("EVALUATION SUMMARY:")
+    print("="*60)
+    print("1. RC Curve/AURC Metrics (for comparison with paper):")
+    print("   - Uses RAW MARGIN (without c) to scan thresholds")
+    print("   - Comparable to original paper evaluation protocol")
+    print("   - Reports full range (0.0-1.0) and focused range (0.2-1.0)")
+    print()
+    print("2. Point Metrics @ c_train (AR-GSE specific):")
+    print("   - Uses FINAL MARGIN (raw margin - c) with fixed threshold=0")
+    print("   - Shows performance at the specific reject cost used in training")
+    print("   - Highlights AR-GSE's ability to optimize for a target trade-off")
+    print("="*60)
 
 if __name__ == '__main__':
     main()

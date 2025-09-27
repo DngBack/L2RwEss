@@ -51,7 +51,8 @@ class AR_GSE(nn.Module):
         eta_mix = torch.clamp(eta_mix, min=1e-8, max=1.0-1e-8)  # Stability + valid probabilities
 
         # 4. Margin & Acceptance Probability
-        margin = self.selective_margin(eta_mix, c, class_to_group)
+        raw_margin = self.raw_margin(eta_mix, class_to_group)  # Raw margin without c
+        margin = raw_margin - c  # Final margin with rejection cost
         s_tau = torch.sigmoid(tau * margin)
 
         return {
@@ -59,6 +60,7 @@ class AR_GSE(nn.Module):
             's_tau': s_tau,
             'w': w,
             'margin': margin,
+            'raw_margin': raw_margin,  # Add raw margin for RC curve evaluation
         }
 
     def selective_margin(self, eta_mix, c, class_to_group):
@@ -85,3 +87,24 @@ class AR_GSE(nn.Module):
         # Positive margin means accept, negative means reject
         margin = max_score - threshold
         return margin
+
+    def raw_margin(self, eta_mix, class_to_group):
+        """Calculates the raw margin m_raw(x) without rejection cost c."""
+        device = eta_mix.device
+        alpha = self.alpha.to(device)
+        mu = self.mu.to(device)
+        class_to_group = class_to_group.to(device)
+
+        # Score: max_y alpha_g(y) * eta_y 
+        score_per_class = alpha[class_to_group] * eta_mix  # [B, C]
+        max_score, _ = score_per_class.max(dim=1)  # [B]
+        
+        # Threshold WITHOUT c: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x)
+        inv_alpha_minus_mu = 1.0 / alpha[class_to_group] - mu[class_to_group]  # [C]
+        inv_alpha_minus_mu = inv_alpha_minus_mu.unsqueeze(0).expand(eta_mix.size(0), -1)  # [B, C]
+        
+        weighted_sum = (inv_alpha_minus_mu * eta_mix).sum(dim=1)  # [B]
+        
+        # Raw margin: score - threshold (no c subtracted)
+        raw_margin = max_score - weighted_sum
+        return raw_margin

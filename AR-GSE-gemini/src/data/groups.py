@@ -3,6 +3,35 @@ import torch
 import numpy as np
 from typing import List
 
+def get_class_to_group_by_threshold(
+    class_counts: List[int], 
+    threshold: int = 20
+) -> torch.LongTensor:
+    """
+    Maps class indices to groups based on a sample count threshold.
+    Classes with sample count > threshold are assigned to group 0 (head),
+    classes with sample count <= threshold are assigned to group 1 (tail).
+
+    Args:
+        class_counts: A list of sample counts for each class.
+        threshold: The sample count threshold for head/tail division.
+
+    Returns:
+        A LongTensor of shape [C] where each element is the group index for that class.
+        Group 0: Head classes (count > threshold)
+        Group 1: Tail classes (count <= threshold)
+    """
+    num_classes = len(class_counts)
+    class_to_group = torch.zeros(num_classes, dtype=torch.long)
+    
+    for class_idx, count in enumerate(class_counts):
+        if count > threshold:
+            class_to_group[class_idx] = 0  # Head group
+        else:
+            class_to_group[class_idx] = 1  # Tail group
+            
+    return class_to_group
+
 def get_class_to_group(
     class_counts: List[int], 
     K: int = 2, 

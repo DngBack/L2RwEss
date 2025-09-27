@@ -9,14 +9,12 @@ Implements the methodology:
 
 import numpy as np
 import json
-import torch
 import torchvision
 import torchvision.transforms as transforms
 from pathlib import Path
 from collections import Counter
 from typing import Dict, List, Tuple, Optional
-from torch.utils.data import Dataset, Subset
-import matplotlib.pyplot as plt
+from torch.utils.data import Dataset
 
 class CIFAR100LTDataset(Dataset):
     """Custom Dataset wrapper for CIFAR-100-LT with flexible indexing."""

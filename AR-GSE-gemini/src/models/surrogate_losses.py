@@ -7,34 +7,23 @@ def selective_cls_loss(
     y_true: torch.Tensor,
     s_tau: torch.Tensor,
     beta: torch.Tensor,
-    alpha: torch.Tensor,
+    alpha: torch.Tensor,              # vẫn giữ tham số để tương thích API
     class_to_group: torch.LongTensor,
     kind: str = "ce"
 ) -> torch.Tensor:
-    """
-    Calculates the surrogate selective classification loss.
-    (Phiên bản đã sửa lỗi device placement)
-    """
-    # Get group for each sample in the batch
-    # All input tensors are already on the correct device.
+    # nhóm của từng mẫu
     sample_groups = class_to_group[y_true]
-    
-    # Get the cost weight for each sample
-    sample_beta = beta[sample_groups]
-    sample_alpha = alpha[sample_groups]
+    sample_beta   = beta[sample_groups]
 
-    # Calculate the per-sample classification loss
+    # per-sample classification loss trên LOG-prob
     if kind == "ce":
-        per_sample_loss = F.cross_entropy(eta_mix, y_true, reduction='none')
+        per_sample_loss = F.nll_loss(torch.log(eta_mix.clamp(1e-6, 1.0)), y_true, reduction='none')
     elif kind == "one_minus_p":
         p_true = eta_mix.gather(1, y_true.unsqueeze(1)).squeeze()
         per_sample_loss = 1 - p_true
     else:
         raise ValueError(f"Unknown loss kind: {kind}")
-    
-    # The classification loss from paper: 
-    # L_cls = Σ_k β_k * α_k * (1/|B|) * Σ_{i∈B} ℓ_cls(x_i, y_i; η̃) * s_τ(x_i) * I{y_i∈G_k}
-    # Per sample: β_k * α_k * ℓ_cls * s_τ (NOT division!)
-    weighted_loss = sample_beta * sample_alpha * per_sample_loss * s_tau
-    
-    return weighted_loss.mean()
+
+    # KHÔNG nhân α ở đây để tránh feedback dương gây nổ
+    weighted = sample_beta * per_sample_loss * s_tau
+    return weighted.mean()
