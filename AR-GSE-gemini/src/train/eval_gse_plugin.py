@@ -40,7 +40,7 @@ CONFIG = {
         'bootstrap_n': 1000,
     },
     'plugin_checkpoint': './checkpoints/argse_worst_eg/cifar100_lt_if100/gse_balanced_plugin.ckpt',
-    'output_dir': './results_worst_plugin/cifar100_lt_if100',
+    'output_dir': './results_worst_eg/cifar100_lt_if100',
     'seed': 42
 }
 
@@ -112,6 +112,19 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         group_accepted = accepted[group_mask]
         group_coverage = group_accepted.float().mean().item()
         
+        # TPR/FPR analysis for this group
+        group_preds_all = preds[group_mask]
+        group_labels_all = labels[group_mask]
+        group_correct = (group_preds_all == group_labels_all)
+        
+        # True Positive Rate (TPR): fraction of correct predictions that are accepted
+        correct_accepted = group_accepted & group_correct
+        tpr = correct_accepted.sum().item() / group_correct.sum().item() if group_correct.sum() > 0 else 0.0
+        
+        # False Positive Rate (FPR): fraction of incorrect predictions that are accepted  
+        incorrect_accepted = group_accepted & (~group_correct)
+        fpr = incorrect_accepted.sum().item() / (~group_correct).sum().item() if (~group_correct).sum() > 0 else 0.0
+        
         if group_accepted.sum() > 0:
             group_preds = preds[group_mask & accepted]
             group_labels = labels[group_mask & accepted]
@@ -131,6 +144,8 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         print(f"  • Size: {group_size} samples")
         print(f"  • Coverage: {group_coverage:.3f}")
         print(f"  • Error: {group_error:.3f}")
+        print(f"  • TPR (correct accepted): {tpr:.3f}")
+        print(f"  • FPR (incorrect accepted): {fpr:.3f}")
         print(f"  • α_k: {alpha[k]:.3f}")
         print(f"  • μ_k: {mu[k]:.3f}")
         print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
@@ -328,8 +343,17 @@ def main():
     # 5.5 Plugin-specific metrics (at optimal threshold)
     plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group_cpu, num_groups)
     results['plugin_metrics_at_threshold'] = plugin_metrics
-    print(f"Plugin metrics @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
-          f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    
+    # Better messaging based on threshold type used
+    t_group = checkpoint.get('t_group', None)
+    if t_group is not None:
+        print(f"Plugin metrics @ per-group thresholds {[f'{t:.3f}' for t in t_group.tolist()]}: "
+              f"Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    else:
+        print(f"Plugin metrics @ global threshold t*={plugin_threshold:.3f}: "
+              f"Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
     
     # 5.5a Detailed Group-wise Analysis
     analyze_group_performance(eta_mix, preds, test_labels, accepted,

@@ -12,11 +12,11 @@ if __name__ == '__main__':
     # Modify configuration for worst-group EG-outer
     from src.train.gse_balanced_plugin import CONFIG
     
-    # Enable worst-group optimization with EG-outer
+    # Enable worst-group optimization with improved EG-outer
     CONFIG['plugin_params']['objective'] = 'worst'
     CONFIG['plugin_params']['use_eg_outer'] = True
-    CONFIG['plugin_params']['eg_outer_T'] = 20
-    CONFIG['plugin_params']['eg_outer_xi'] = 1.0
+    CONFIG['plugin_params']['eg_outer_T'] = 30         # More iterations
+    CONFIG['plugin_params']['eg_outer_xi'] = 0.2       # Reduced step size for stability
     
     # Update output directory
     CONFIG['output']['checkpoints_dir'] = './checkpoints/argse_worst_eg/'

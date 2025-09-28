@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from src.train.gse_balanced_plugin import (
     c_for_target_coverage_from_raw,
-    update_alpha_fixed_point, update_alpha_fixed_point_conditional,
+    update_alpha_fixed_point,
     worst_error_on_S
 )
 
@@ -31,7 +31,7 @@ def inner_cost_sensitive_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                                 beta, lambda_grid, M=8, alpha_steps=4,
                                 cov_target=0.58, gamma=0.25, use_conditional_alpha=False):
     """
-    Inner cost-sensitive plugin optimization for given beta.
+    Improved inner cost-sensitive plugin optimization with blended alpha updates.
     
     Args:
         eta_S1, y_S1: S1 split data
@@ -51,36 +51,70 @@ def inner_cost_sensitive_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     """
     device = eta_S1.device
     alpha = torch.ones(K, device=device)
-    best = {"score": float("inf")}
+    best = {"score": float("inf"), "lambda_idx": None}
     mus = []
+    lambda_grid = list(lambda_grid)  # Ensure it's mutable
+    
     for lam in lambda_grid:
         if K==2: 
             mus.append(torch.tensor([lam/2.0, -lam/2.0], device=device))
         else: 
             raise NotImplementedError("Provide mu grid for K>2")
 
-    for _ in range(M):
-        for lam, mu in zip(lambda_grid, mus):
+    for m in range(M):
+        best_lambda_idx = None
+        for i, (lam, mu) in enumerate(zip(lambda_grid, mus)):
             a_cur = alpha.clone()
             t_cur = None
+            
+            # Import blended alpha update from main plugin
+            from src.train.gse_balanced_plugin import update_alpha_fixed_point_blend
+            
             for _ in range(alpha_steps):
                 raw_S1 = compute_raw_margin_with_beta(eta_S1, a_cur, mu, beta, class_to_group)
                 t_cur = c_for_target_coverage_from_raw(raw_S1, cov_target)
+                
+                # Use blended alpha update for better stability
                 if use_conditional_alpha:
-                    a_cur = update_alpha_fixed_point_conditional(eta_S1, y_S1, a_cur, mu, t_cur, class_to_group, K, gamma=gamma)
+                    a_cur = update_alpha_fixed_point_blend(eta_S1, y_S1, a_cur, mu, t_cur, 
+                                                         class_to_group, K, gamma=gamma, 
+                                                         blend_lambda=0.25)
                 else:
-                    a_cur = update_alpha_fixed_point(eta_S1, y_S1, a_cur, mu, t_cur, class_to_group, K, gamma=gamma, use_conditional=False)
+                    a_cur = update_alpha_fixed_point(eta_S1, y_S1, a_cur, mu, t_cur, 
+                                                   class_to_group, K, gamma=gamma, use_conditional=False)
 
             w_err, gerrs = worst_error_on_S(eta_S2, y_S2, a_cur, mu, t_cur, class_to_group, K)
             if w_err < best["score"]:
                 best.update(dict(score=w_err, alpha=a_cur.clone(), mu=mu.clone(), t=t_cur))
+                best_lambda_idx = i
+                
+        # Adaptive lambda grid expansion when best hits boundary
+        if best_lambda_idx is not None and best_lambda_idx in [0, len(lambda_grid)-1]:
+            step = lambda_grid[1] - lambda_grid[0] if len(lambda_grid) > 1 else 0.25
+            if best_lambda_idx == 0:
+                new_min = lambda_grid[0] - 4*step
+                lambda_grid = np.linspace(new_min, lambda_grid[-1], len(lambda_grid)+4).tolist()
+            else:
+                new_max = lambda_grid[-1] + 4*step
+                lambda_grid = np.linspace(lambda_grid[0], new_max, len(lambda_grid)+4).tolist()
+            
+            # Update mus for new lambda grid
+            mus = []
+            for lam in lambda_grid:
+                if K==2: 
+                    mus.append(torch.tensor([lam/2.0, -lam/2.0], device=device))
+            
+            print(f"↔️ Expanded lambda_grid to [{lambda_grid[0]:.2f}, {lambda_grid[-1]:.2f}] ({len(lambda_grid)} pts)")
+                
         alpha = 0.5*alpha + 0.5*best["alpha"]
+    
     return best["alpha"], best["mu"], best["t"], best["score"]
 
 def worst_group_eg_outer(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
-                         T=25, xi=1.0, lambda_grid=None, **inner_kwargs):
+                         T=30, xi=0.2, lambda_grid=None, beta_floor=0.05, 
+                         beta_momentum=0.25, patience=6, **inner_kwargs):
     """
-    Worst-group EG-outer algorithm.
+    Improved Worst-group EG-outer algorithm with anti-collapse and smooth updates.
     
     Args:
         eta_S1, y_S1: S1 split data
@@ -88,8 +122,11 @@ def worst_group_eg_outer(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
         class_to_group: class to group mapping
         K: number of groups
         T: number of EG outer iterations
-        xi: EG step size
+        xi: EG step size (reduced for stability)
         lambda_grid: lambda values for inner optimization
+        beta_floor: minimum beta value to prevent collapse
+        beta_momentum: EMA factor for beta updates
+        patience: early stopping patience
         **inner_kwargs: additional arguments for inner optimization
     
     Returns:
@@ -101,12 +138,15 @@ def worst_group_eg_outer(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     
     # Initialize uniform beta
     beta = torch.full((K,), 1.0/K, device=device)
+    best = {"score": float("inf"), "alpha": None, "mu": None, "t": None, "beta": beta.clone()}
     history = []
+    no_improve = 0
 
-    print(f"Starting EG-outer with T={T}, xi={xi}, lambda_grid=[{lambda_grid[0]:.2f}, {lambda_grid[-1]:.2f}]")
+    print(f"Starting improved EG-outer with T={T}, xi={xi}, beta_floor={beta_floor}, momentum={beta_momentum}")
+    print(f"Lambda grid: [{lambda_grid[0]:.2f}, {lambda_grid[-1]:.2f}] ({len(lambda_grid)} points)")
 
     for t in range(T):
-        print(f"EG iteration {t+1}/{T}, β={beta.detach().cpu().tolist()}")
+        print(f"EG iteration {t+1}/{T}, β={[f'{b:.4f}' for b in beta.detach().cpu().tolist()]}")
         
         # Inner optimization with current beta
         a_t, m_t, thr_t, _ = inner_cost_sensitive_plugin(
@@ -116,20 +156,46 @@ def worst_group_eg_outer(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
         
         # Compute per-group errors on S2
         w_err, gerrs = worst_error_on_S(eta_S2, y_S2, a_t, m_t, thr_t, class_to_group, K)
-        print(f"  Worst error: {w_err:.4f}, Group errors: {[f'{g:.4f}' for g in gerrs]}")
         
-        # EG update: β_k ← β_k * exp(xi * error_k)
-        with torch.no_grad():
-            e = torch.tensor(gerrs, device=device)
-            beta = beta * torch.exp(xi * e)   # EG update
-            beta = beta / beta.sum()           # Normalize
+        # ① Centering errors for relative comparison
+        e = torch.tensor(gerrs, device=device)
+        e_centered = e - e.mean()
+        
+        # ② EG update with beta floor to prevent collapse
+        beta_new = beta * torch.exp(xi * e_centered)
+        beta_new = beta_new + beta_floor / K  # ③ Floor to prevent collapse
+        beta_new = beta_new / beta_new.sum()  # Normalize
+        
+        # ④ EMA/momentum for smooth updates
+        beta = (1 - beta_momentum) * beta + beta_momentum * beta_new
+        beta = beta / beta.sum()  # Ensure normalization
+        
+        # ⑤ Early stopping based on worst error improvement
+        if w_err + 1e-6 < best["score"]:
+            best.update({
+                "score": w_err, 
+                "alpha": a_t.clone(), 
+                "mu": m_t.clone(), 
+                "t": float(thr_t), 
+                "beta": beta.clone()
+            })
+            no_improve = 0
+            print(f"  ✅ NEW BEST! Worst={w_err:.4f}, Group errors: {[f'{g:.4f}' for g in gerrs]}")
+        else:
+            no_improve += 1
+            print(f"  Worst={w_err:.4f}, Group errors: {[f'{g:.4f}' for g in gerrs]} (no improve: {no_improve})")
             
-        history.append(dict(
-            iteration=t+1,
-            beta=beta.detach().cpu().tolist(), 
-            gerrs=[float(x) for x in gerrs],
-            worst_error=float(w_err)
-        ))
+            if no_improve >= patience:
+                print(f"⏹ Early stop EG at iter {t+1}, best worst={best['score']:.4f}")
+                break
+                
+        history.append({
+            "iteration": t+1,
+            "beta": beta.detach().cpu().tolist(), 
+            "gerrs": [float(x) for x in gerrs],
+            "worst_error": float(w_err),
+            "centered_errors": e_centered.detach().cpu().tolist()
+        })
 
     print("✅ EG-outer optimization complete")
-    return a_t, m_t, thr_t, beta.detach().cpu(), history
+    return best["alpha"], best["mu"], best["t"], best["beta"].detach().cpu(), history

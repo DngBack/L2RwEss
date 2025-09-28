@@ -33,7 +33,7 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'plugin_params': {
-        'c': 0.7,  # rejection cost
+        'c': 0.2,  # rejection cost
         'M': 12,   # More iterations for better convergence  
         'gamma': 0.20,  # Reduced EMA for stability
         'alpha_min': 0.85,   # Focused bounds around optimal region
@@ -615,20 +615,28 @@ def main():
     print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")
 
     # Optional: Fit per-group thresholds for better worst-group performance
-    print("\n=== Fitting Per-Group Thresholds (Mondrian) ===")
-    raw_S1 = compute_raw_margin(eta_S1.to(DEVICE), alpha_star.to(DEVICE), mu_star.to(DEVICE), class_to_group.to(DEVICE))
-    preds_S1 = (alpha_star[class_to_group.to(DEVICE)] * eta_S1.to(DEVICE)).argmax(dim=1).cpu()
-    pred_groups_S1 = class_to_group[preds_S1].cpu()
+    print("\n=== Fitting Per-Group Thresholds (Mondrian) on Correct Predictions ===")
     
-    # Set coverage target per group - lower for tail to reduce worst-group error
+    # Ensure all tensors are on the same device for computation
+    eta_S1_device = eta_S1.to(DEVICE)
+    alpha_star_device = alpha_star.to(DEVICE) 
+    mu_star_device = mu_star.to(DEVICE)
+    class_to_group_device = class_to_group.to(DEVICE)
+    
+    raw_S1 = compute_raw_margin(eta_S1_device, alpha_star_device, mu_star_device, class_to_group_device)
+    preds_S1 = (alpha_star_device[class_to_group_device] * eta_S1_device).argmax(dim=1).cpu()
+    pred_groups_S1 = class_to_group[preds_S1.cpu()].cpu()
+    correct_S1 = (preds_S1.cpu() == y_S1.cpu())  # Correct predictions mask
+    
+    # Set coverage target per group - more aggressive for tail to reduce FP
     if num_groups == 2:
-        target_cov_by_group = [0.60, 0.45]  # head=0.60, tail=0.45
-        print("Using different coverage targets: head=0.60, tail=0.45")
+        target_cov_by_group = [0.58, 0.42]  # head=0.58, tail=0.42 (more aggressive)
+        print("Using different coverage targets: head=0.58, tail=0.42 (fitted on correct predictions only)")
     else:
         target_cov_by_group = [CONFIG['plugin_params']['cov_target']] * num_groups
     
     from src.train.per_group_threshold import fit_group_thresholds_from_raw
-    t_group = fit_group_thresholds_from_raw(raw_S1.cpu(), pred_groups_S1, target_cov_by_group, K=num_groups)
+    t_group = fit_group_thresholds_from_raw(raw_S1.cpu(), pred_groups_S1, target_cov_by_group, K=num_groups, correct_mask=correct_S1)
     print(f"Per-group thresholds: {t_group.tolist()}")
     
     # 7) Save results
