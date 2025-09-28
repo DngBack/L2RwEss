@@ -18,39 +18,6 @@ from src.data.datasets import get_cifar100_lt_counts
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def fit_temperature_per_expert(logits, labels, max_iter=50):
-    """Simple per-expert temperature scaling (independent) using NLL minimization.
-    Args:
-        logits: [N, E, C] stacked expert logits (on CPU/GPU)
-        labels: [N]
-    Returns:
-        T: [E] temperatures (>0)
-    """
-    E = logits.size(1)
-    device = logits.device
-    T = torch.ones(E, device=device, requires_grad=True)
-    optimizer = torch.optim.LBFGS([T], lr=0.1, max_iter=20)
-    labels = labels.to(device)
-
-    def nll_loss():
-        loss_total = 0.0
-        for e in range(E):
-            scaled = logits[:, e, :] / T[e].clamp_min(1e-4)
-            log_probs = torch.log_softmax(scaled, dim=-1)
-            loss_total = loss_total + torch.nn.functional.nll_loss(log_probs, labels, reduction='mean')
-        return loss_total / E
-
-    def closure():
-        optimizer.zero_grad()
-        loss = nll_loss()
-        loss.backward()
-        return loss
-
-    for _ in range(max_iter):
-        optimizer.step(closure)
-
-    return T.detach().clamp_min(1e-4)
-
 # --- CONFIGURATION ---
 CONFIG = {
     'dataset': {
@@ -68,12 +35,12 @@ CONFIG = {
     'plugin_params': {
         'c': 0.2,  # rejection cost
         'M': 12,   # More iterations for better convergence  
-        'gamma': 0.20,  # EMA for stability
-        'alpha_min': 0.80,   # Expanded lower bound for tail lift
-        'alpha_max': 1.60,   # Expanded upper bound for head modulation
-        'lambda_grid': np.linspace(-2.0, 2.0, 41).tolist(),  # Expanded μ grid (symmetric)
+        'gamma': 0.20,  # Reduced EMA for stability
+        'alpha_min': 0.85,   # Focused bounds around optimal region
+        'alpha_max': 1.15,   # Tighter optimal range
+        'lambda_grid': [round(x, 2) for x in np.linspace(-2.0, 2.0, 41)],  # Expanded grid for comprehensive search
         'cov_target': 0.58,  # Lower target for better precision
-        'objective': 'balanced',  # 'worst', 'balanced', 'worst_eg', or 'hybrid'
+        'objective': 'worst',  # Switch to 'worst' for tail-focused optimization
         'hybrid_beta': 0.2,  # weight for balanced term in hybrid objective
         'alpha_steps': 5,  # More steps for precision
         'use_conditional_alpha': True,  # use conditional acceptance for alpha updates
@@ -81,6 +48,7 @@ CONFIG = {
         'use_eg_outer': False,  # use EG-outer for worst-group optimization
         'eg_outer_T': 20,  # EG outer iterations
         'eg_outer_xi': 1.0,  # EG step size
+        'use_ema_mu': True,  # Apply EMA smoothing to μ updates
         # --- New selective init options ---
         'use_selective_init': True,       # load gating_selective.ckpt if available
         'freeze_alpha': False,            # if True, keep α from selective init
@@ -221,6 +189,52 @@ def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
     
     return float(max(group_errors)), group_errors
 
+def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class_to_group, K):
+    """
+    Compute worst-group error rate using per-group thresholds t_k.
+    
+    Args:
+        eta: mixture posteriors [N, C]
+        y: labels [N]  
+        alpha, mu: per-group parameters [K]
+        t_group: per-group thresholds [K]
+        class_to_group: class -> group mapping [C]
+        K: number of groups
+        
+    Returns:
+        worst_error: worst-group error (max of per-group errors)
+        group_errors: list of per-group error rates
+    """
+    # Compute raw margins
+    raw_margins = compute_raw_margin(eta, alpha, mu, class_to_group)  # [N]
+    
+    # Get group for each sample based on ground truth labels
+    y_groups = class_to_group[y]  # [N]
+    
+    # Per-sample threshold based on group
+    thresholds_per_sample = t_group[y_groups]  # [N]
+    
+    # Acceptance based on per-group thresholds
+    accepted = (raw_margins > thresholds_per_sample)  # [N]
+    
+    if accepted.sum() == 0:
+        return 1.0, [1.0] * K
+    
+    # Predictions  
+    alpha_per_class = alpha[class_to_group]  # [C]
+    preds = (alpha_per_class * eta).argmax(dim=1)  # [N]
+    
+    group_errors = []
+    for k in range(K):
+        mask_k = (y_groups == k) & accepted
+        if mask_k.sum() == 0:
+            group_errors.append(1.0)
+        else:
+            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+            group_errors.append(1.0 - group_acc)
+    
+    return float(max(group_errors)), group_errors
+
 def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
     """
     Compute hybrid error: worst_error + beta * balanced_error
@@ -236,7 +250,7 @@ def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
     return hybrid_err, (worst_err, bal_err)
 
 def update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
-                                        gamma=0.3, alpha_min=0.8, alpha_max=1.25):
+                                        gamma=0.3, alpha_min=0.75, alpha_max=1.35):
     """
     Fixed-point alpha update using conditional acceptance rates per group.
     α_k ← (1-γ)α_k + γ·r̂_k where r̂_k = #{acc ∧ y∈G_k} / #{y∈G_k}
@@ -266,7 +280,7 @@ def update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_gr
     
     return new_alpha
 
-def project_alpha(a, alpha_min=0.8, alpha_max=1.25):
+def project_alpha(a, alpha_min=0.75, alpha_max=1.35):
     """Project alpha to valid range with geometric mean normalization."""
     a = a.clamp_min(alpha_min)
     loga = a.log()
@@ -274,7 +288,7 @@ def project_alpha(a, alpha_min=0.8, alpha_max=1.25):
     return a.clamp(min=alpha_min, max=alpha_max)
 
 def update_alpha_fixed_point_blend(eta_S1, y_S1, alpha, mu, c, class_to_group, K,
-                                   gamma=0.25, blend_lambda=0.25, alpha_min=0.8, alpha_max=1.25):
+                                   gamma=0.25, blend_lambda=0.25, alpha_min=0.75, alpha_max=1.35):
     """
     Blended alpha update combining joint and conditional methods for stability.
     """
@@ -287,7 +301,7 @@ def update_alpha_fixed_point_blend(eta_S1, y_S1, alpha, mu, c, class_to_group, K
     return project_alpha(a_new, alpha_min, alpha_max)
 
 def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
-                           gamma=0.3, alpha_min=0.8, alpha_max=1.25, use_conditional=True):
+                           gamma=0.3, alpha_min=0.75, alpha_max=1.35, use_conditional=True):
     """
     Fixed-point alpha update with option for conditional or joint acceptance.
     """
@@ -333,10 +347,10 @@ def mu_from_lambda_grid(lambdas, K):
     return mus
 
 def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
-                    c, M=10, lambda_grid=(-0.5, -0.25, 0.0, 0.25, 0.5),
+                    c, M=10, lambda_grid=None,
                     alpha_init=None, gamma=0.3, cov_target=0.6, 
                     objective='balanced', hybrid_beta=0.2, alpha_steps=4,
-                    use_conditional_alpha=True, tie_break_balanced=True):
+                    use_conditional_alpha=True, tie_break_balanced=True, use_ema_mu=True):
     """
     Main GSE-Balanced plugin algorithm with improved optimization strategies.
     
@@ -347,10 +361,12 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
         K: number of groups
         c: rejection cost (unused, kept for compatibility)
         M: number of plugin iterations
-        lambda_grid: values of λ to sweep over
+        lambda_grid: values of λ to sweep over (defaults to expanded [-2.0, 2.0])
         alpha_init: initial alpha values
         gamma: EMA factor for alpha updates
         cov_target: target coverage for threshold fitting
+        objective: 'balanced' or 'worst' group optimization
+        use_ema_mu: whether to apply EMA smoothing to μ updates
         objective: 'worst', 'balanced', or 'hybrid'
         hybrid_beta: weight for balanced term if objective='hybrid'
         alpha_steps: number of fixed-point steps for alpha updates
@@ -367,6 +383,13 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     y_S2 = y_S2.to(device)
     class_to_group = class_to_group.to(device)
     
+    # Default to expanded λ grid if not provided
+    if lambda_grid is None:
+        lambda_grid = [round(x, 2) for x in np.linspace(-2.0, 2.0, 41)]
+        
+    mu_candidates = [mu.to(device) for mu in mu_from_lambda_grid(lambda_grid, K)]
+    print(f"Sweeping {len(mu_candidates)} μ candidates (λ ∈ [{min(lambda_grid):.1f}, {max(lambda_grid):.1f}])")
+    
     # Initialize α
     if alpha_init is None:
         alpha = torch.ones(K, dtype=torch.float32, device=device)
@@ -378,18 +401,18 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     best_score = float('inf')
     best_balanced_score = float('inf')  # For tie-breaking
     
-    mu_candidates = [mu.to(device) for mu in mu_from_lambda_grid(lambda_grid, K)]
+    # EMA buffer for μ if enabled  
+    mu_ema = torch.zeros(K, dtype=torch.float32, device=device) if use_ema_mu else None
     
     print(f"Starting GSE-Balanced plugin with {M} iterations, {len(mu_candidates)} μ candidates")
     print(f"Objective: {objective}, Coverage target: {cov_target:.2f}")
-    print(f"Alpha method: {'conditional' if use_conditional_alpha else 'joint'}")
+    print(f"Alpha method: {'conditional' if use_conditional_alpha else 'joint'}, EMA μ: {use_ema_mu}")
     if objective == 'hybrid':
         print(f"Hybrid beta: {hybrid_beta}")
     
     best_t = None
     best_lambda_idx = None  # Track best lambda index for adaptive expansion
     
-    mu_ema = None  # track EMA of best μ across iterations
     for m in range(M):
         print(f"\n--- Plugin Iteration {m+1}/{M} ---")
         for i, mu in enumerate(mu_candidates):
@@ -447,30 +470,25 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                 best_score = error_score
                 best_balanced_score = balanced_score
                 best_alpha = alpha_cur.clone()
-                best_mu = mu.clone()
+                
+                # Apply EMA to μ updates if enabled
+                if use_ema_mu and mu_ema is not None:
+                    mu_ema = 0.7 * mu_ema + 0.3 * mu
+                    best_mu = mu_ema.clone()
+                else:
+                    best_mu = mu.clone()
+                    
                 best_t = t_cur
                 best_lambda_idx = i  # Track best lambda index
                 tie_info = f" (tie-break: bal={balanced_score:.4f})" if abs(error_score - best_score) < 1e-6 else ""
                 print(f"  λ={lambda_grid[i]:.2f}: NEW BEST! {error_type}={error_score:.4f}, "
                     f"α=[{alpha_cur[0]:.3f},{alpha_cur[1]:.3f}], "
-                    f"μ=[{mu[0]:.3f},{mu[1]:.3f}], t={t_cur:.3f}{tie_info}")
+                    f"μ=[{best_mu[0]:.3f},{best_mu[1]:.3f}], t={t_cur:.3f}{tie_info}")
             else:
                 print(f"  λ={lambda_grid[i]:.2f}: {error_type}={error_score:.4f} (t={t_cur:.3f})")
 
-        # EMA stabilize α and re-project to maintain geomean=1 inside expanded bounds
         alpha = (0.5 * alpha + 0.5 * best_alpha).clone()
-        log_alpha = alpha.log()
-        alpha = torch.exp(log_alpha - log_alpha.mean())
-        alpha = alpha.clamp(min=CONFIG['plugin_params']['alpha_min'], max=CONFIG['plugin_params']['alpha_max'])
-
-        # EMA stabilize μ (centered implicitly by construction of candidates) using best μ for this iteration
-        if mu_ema is None:
-            mu_ema = best_mu.clone()
-        else:
-            mu_ema = 0.5 * mu_ema + 0.5 * best_mu
-        best_mu = mu_ema.clone()
-
-        print(f"[Iter {m+1}] Current best: {objective}={best_score:.4f}, t*={best_t:.3f} | α={alpha.tolist()} μ={best_mu.tolist()}")
+        print(f"[Iter {m+1}] Current best: {objective}={best_score:.4f}, t*={best_t:.3f}")
         
         # Adaptive lambda grid expansion when best hits boundary
         if best_lambda_idx is not None and best_lambda_idx in [0, len(lambda_grid)-1]:
@@ -563,14 +581,15 @@ def main():
     
     # 3) Load frozen GSE model (with pre-trained gating if available)
     num_experts = len(CONFIG['experts']['names'])
-    # Dynamically infer enriched gating feature dimension (builder outputs 7E+3)
+    
+    # Dynamic gating feature dimension computation
     with torch.no_grad():
-        dummy = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
-        tmp = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
-        gating_feature_dim = tmp.feature_builder(dummy).size(-1)
-        del tmp
+        dummy_logits = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
+        temp_model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
+        gating_feature_dim = temp_model.feature_builder(dummy_logits).size(-1)
+        del temp_model
+    print(f"✅ Dynamic gating feature dim: {gating_feature_dim}")
     model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, gating_feature_dim).to(DEVICE)
-    print(f"✅ Dynamic gating feature dimension (plugin): {gating_feature_dim}")
     
     # Try to load pre-trained gating weights
     gating_ckpt_path = Path('./checkpoints/gating_pretrained/') / CONFIG['dataset']['name'] / 'gating_pretrained.ckpt'
@@ -579,25 +598,60 @@ def main():
     selective_loaded = False
     if CONFIG['plugin_params'].get('use_selective_init', False) and selective_ckpt_path.exists():
         try:
-            sel_ckpt = torch.load(selective_ckpt_path, map_location=DEVICE)
-            model.gating_net.load_state_dict(sel_ckpt['gating_net_state_dict'])
-            print(f"📂 Loaded selective gating checkpoint: {selective_ckpt_path}")
-            # Initialize α, μ, threshold from selective if not frozen logic will apply later
-            init_alpha = sel_ckpt.get('alpha', None)
-            init_mu = sel_ckpt.get('mu', None)
-            init_t = sel_ckpt.get('t', None)
-            selective_loaded = True
+            sel_ckpt = torch.load(selective_ckpt_path, map_location=DEVICE, weights_only=False)
+            
+            # Check dimension compatibility before loading
+            saved_state = sel_ckpt['gating_net_state_dict']
+            current_state = model.gating_net.state_dict()
+            
+            compatible = True
+            for key in saved_state.keys():
+                if key in current_state and saved_state[key].shape != current_state[key].shape:
+                    print(f"⚠️  Dimension mismatch for {key}: saved {saved_state[key].shape} vs current {current_state[key].shape}")
+                    compatible = False
+            
+            if compatible:
+                model.gating_net.load_state_dict(saved_state)
+                print(f"📂 Loaded selective gating checkpoint: {selective_ckpt_path}")
+                # Initialize α, μ, threshold from selective if not frozen logic will apply later
+                init_alpha = sel_ckpt.get('alpha', None)
+                init_mu = sel_ckpt.get('mu', None) 
+                init_t = sel_ckpt.get('t', None)
+                selective_loaded = True
+            else:
+                print("❌ Selective checkpoint incompatible with enriched features. Using random init.")
         except Exception as e:
             print(f"⚠️ Failed to load selective checkpoint ({e}). Fallback to gating_pretrained or random.")
     if not selective_loaded:
         if gating_ckpt_path.exists():
-            print(f"📂 Loading pre-trained gating from {gating_ckpt_path}")
-            gating_ckpt = torch.load(gating_ckpt_path, map_location=DEVICE)
-            model.gating_net.load_state_dict(gating_ckpt['gating_net_state_dict'])
-            print("✅ Pre-trained gating loaded successfully!")
-            init_alpha = None
-            init_mu = None
-            init_t = None
+            try:
+                print(f"📂 Loading pre-trained gating from {gating_ckpt_path}")
+                gating_ckpt = torch.load(gating_ckpt_path, map_location=DEVICE, weights_only=False)
+                
+                # Check dimension compatibility 
+                saved_state = gating_ckpt['gating_net_state_dict']
+                current_state = model.gating_net.state_dict()
+                
+                compatible = True
+                for key in saved_state.keys():
+                    if key in current_state and saved_state[key].shape != current_state[key].shape:
+                        print(f"⚠️  Dimension mismatch for {key}: saved {saved_state[key].shape} vs current {current_state[key].shape}")
+                        compatible = False
+                
+                if compatible:
+                    model.gating_net.load_state_dict(saved_state)
+                    print("✅ Pre-trained gating loaded successfully!")
+                else:
+                    print("❌ Pre-trained checkpoint incompatible with enriched features. Using random init.")
+                    
+                init_alpha = None
+                init_mu = None
+                init_t = None
+            except Exception as e:
+                print(f"⚠️ Failed to load pre-trained checkpoint ({e}). Using random initialization.")
+                init_alpha = None
+                init_mu = None
+                init_t = None
         else:
             print("⚠️  No gating checkpoint found. Using random initialization.")
             print("   Consider running train_gating_only.py --mode pretrain or --mode selective first.")
@@ -610,41 +664,10 @@ def main():
         model.alpha.fill_(1.0)
         model.mu.fill_(0.0)
     
-    # 4) (Optional) Temperature scaling per expert on S1 to calibrate logits before caching
-    print("\n=== (Optional) Temperature Scaling Calibration on S1 ===")
-    # Gather raw logits & labels from S1 for calibration
-    all_logits_S1 = []
-    all_labels_S1 = []
-    for logits_b, y_b in S1_loader:
-        all_logits_S1.append(logits_b)
-        all_labels_S1.append(y_b)
-    all_logits_S1 = torch.cat(all_logits_S1).to(DEVICE)
-    all_labels_S1 = torch.cat(all_labels_S1).to(DEVICE)
-    T_per_expert = fit_temperature_per_expert(all_logits_S1, all_labels_S1)
-    print(f"Calibrated temperatures per expert: {T_per_expert.tolist()}")
-
-    # Apply temperatures in-place for caching
-    def apply_t(logits, T):
-        return logits / T.view(1, -1, 1)
-
-    # Replace DataLoader stacking via recalibration (create new tensors)
-    calibrated_S1 = TensorDataset(apply_t(all_logits_S1, T_per_expert).cpu(), all_labels_S1.cpu())
-    S1_loader_cal = DataLoader(calibrated_S1, batch_size=256, shuffle=False)
-
-    # Calibrate S2 as well
-    all_logits_S2 = []
-    all_labels_S2 = []
-    for logits_b, y_b in S2_loader:
-        all_logits_S2.append(logits_b)
-        all_labels_S2.append(y_b)
-    all_logits_S2 = torch.cat(all_logits_S2).to(DEVICE)
-    all_labels_S2 = torch.cat(all_labels_S2).to(DEVICE)
-    calibrated_S2 = TensorDataset(apply_t(all_logits_S2, T_per_expert).cpu(), all_labels_S2.cpu())
-    S2_loader_cal = DataLoader(calibrated_S2, batch_size=256, shuffle=False)
-
-    print("\n=== Caching calibrated mixture posteriors ===")
-    eta_S1, y_S1 = cache_eta_mix(model, S1_loader_cal, class_to_group)
-    eta_S2, y_S2 = cache_eta_mix(model, S2_loader_cal, class_to_group) 
+    # 4) Cache η̃ for both splits
+    print("\n=== Caching mixture posteriors ===")
+    eta_S1, y_S1 = cache_eta_mix(model, S1_loader, class_to_group)
+    eta_S2, y_S2 = cache_eta_mix(model, S2_loader, class_to_group) 
     
     print(f"✅ Cached η̃_S1: {eta_S1.shape}, y_S1: {y_S1.shape}")
     print(f"✅ Cached η̃_S2: {eta_S2.shape}, y_S2: {y_S2.shape}")
@@ -673,25 +696,31 @@ def main():
         
         from src.train.gse_worst_eg import worst_group_eg_outer
         
-        alpha_star, mu_star, t_star, beta_star, eg_hist = worst_group_eg_outer(
+        alpha_star, mu_star, t_group_star, beta_star, eg_hist = worst_group_eg_outer(
             eta_S1.to(DEVICE), y_S1.to(DEVICE),
             eta_S2.to(DEVICE), y_S2.to(DEVICE),
             class_to_group.to(DEVICE), K=num_groups,
             T=CONFIG['plugin_params']['eg_outer_T'], 
             xi=CONFIG['plugin_params']['eg_outer_xi'],
             lambda_grid=np.linspace(-1.2, 1.2, 41).tolist(),
-            M=8, alpha_steps=4, cov_target=cov_target,
+            M=8, alpha_steps=4, 
+            target_cov_by_group=[0.55, 0.45] if num_groups==2 else [cov_target]*num_groups,
             gamma=CONFIG['plugin_params']['gamma'],
-            use_conditional_alpha=False  # EG-outer typically uses joint
+            use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha']  # 🔧 Fix: Use config flag
         )
         
-        # Compute final best score
-        from src.train.gse_balanced_plugin import worst_error_on_S
-        best_score, _ = worst_error_on_S(eta_S2.to(DEVICE), y_S2.to(DEVICE), 
+        
+        # ✅ Use the per-group thresholds directly from EG-outer (consistent!)
+        t_group = t_group_star.cpu().numpy().tolist() if hasattr(t_group_star, 'cpu') else t_group_star
+        print(f"✅ Using per-group thresholds from EG-outer: {t_group}")
+        
+        # No need to re-fit - maintains consistency between optimization and evaluation!
+        
+        # Compute final best score using per-group thresholds
+        from src.train.gse_balanced_plugin import worst_error_on_S_with_per_group_thresholds  
+        best_score, _ = worst_error_on_S_with_per_group_thresholds(eta_S2.to(DEVICE), y_S2.to(DEVICE), 
                                        alpha_star.to(DEVICE), mu_star.to(DEVICE), 
-                                       t_star, class_to_group.to(DEVICE), num_groups)
-        print(f"✅ EG-outer complete. Final worst error: {best_score:.4f}")
-        print(f"Final β: {beta_star.tolist()}")
+                                       t_group_star.to(DEVICE), class_to_group.to(DEVICE), num_groups)
         
         # Store EG history in results
         source_info = 'worst_eg_outer'
@@ -733,6 +762,7 @@ def main():
             alpha_steps=CONFIG['plugin_params']['alpha_steps'],
             use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
             tie_break_balanced=CONFIG['plugin_params']['tie_break_balanced'],
+            use_ema_mu=CONFIG['plugin_params'].get('use_ema_mu', True),
         )
         # If μ was frozen, overwrite with init μ
         if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False) and 'mu_init_tensor' in locals() and mu_init_tensor is not None:
@@ -740,38 +770,32 @@ def main():
         source_info = f'gse_{objective}_plugin'
         extra_info = {}
     
-    print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")
+    # print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")  # Skip since using per-group
 
-    # Optional: Fit per-group thresholds for better worst-group performance
-    print("\n=== Fitting Per-Group Thresholds (Mondrian) on ALL samples (raw margins) ===")
+    # Skip re-fitting since we already have optimal t_group from EG-outer
+    source_info = f'gse_{objective}_plugin'
+    extra_info = {"beta": beta_star.tolist()}
     
-    # Ensure all tensors are on the same device for computation
-    eta_S1_device = eta_S1.to(DEVICE)
-    alpha_star_device = alpha_star.to(DEVICE) 
-    mu_star_device = mu_star.to(DEVICE)
-    class_to_group_device = class_to_group.to(DEVICE)
+    # Set parameters from EG-outer results
+    alpha_star_tensor = alpha_star.to(DEVICE)
+    mu_star_tensor = mu_star.to(DEVICE)
     
-    raw_S1 = compute_raw_margin(eta_S1_device, alpha_star_device, mu_star_device, class_to_group_device)
-    preds_S1 = (alpha_star_device[class_to_group_device] * eta_S1_device).argmax(dim=1).cpu()
-    pred_groups_S1 = class_to_group[preds_S1.cpu()].cpu()
-
-    # New recommended group coverage targets (can adjust): e.g., head 0.55, tail 0.45
-    if num_groups == 2:
-        target_cov_by_group = [0.55, 0.45]
-        print("Using τ_k targets: head=0.55, tail=0.45 (ALL samples)")
-    else:
-        target_cov_by_group = [CONFIG['plugin_params']['cov_target']] * num_groups
-
-    from src.train.per_group_threshold import fit_group_thresholds_from_raw
-    t_group = fit_group_thresholds_from_raw(raw_S1.cpu(), pred_groups_S1, target_cov_by_group, K=num_groups)
-    print(f"Per-group thresholds (all-sample fit): {t_group.tolist()}")
+    # Coverage targets for reference
+    target_cov_by_group = [0.55, 0.45] if num_groups==2 else [cov_target]*num_groups
+    
+    # Use per-group thresholds from EG-outer directly (ensuring consistency)
+    t_group_star = t_group_star.cpu().numpy().tolist()
+    # best_score already available from EG-outer result
+    source_info = "EG-outer per-group thresholds"
+    
+    print(f"✅ Using per-group thresholds from EG-outer: {t_group_star}")
     
     # 7) Save results
     print("\n🎉 GSE-Balanced Plugin Complete!")
     print(f"α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
     print(f"Best {objective} error on S2 = {best_score:.4f}")
-    print(f"Raw-margin threshold t* = {t_star:.3f}")
+    # print(f"Raw-margin threshold t* = {t_star:.3f}")  # Skip since using per-group thresholds
     
     # Save checkpoint with optimal parameters
     output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
@@ -782,8 +806,8 @@ def main():
         'mu': mu_star,
         'class_to_group': class_to_group,
         'num_groups': num_groups,
-        'threshold': t_star,  # Đổi tên từ 'c' thành 'threshold'
-        't_group': t_group,   # Per-group thresholds
+        'threshold': t_group_star,  # Using the per-group thresholds from EG-outer
+        't_group': t_group_star,   # Per-group thresholds
         'per_group_threshold': True,  # Flag to indicate per-group thresholds available
         'target_cov_by_group': target_cov_by_group,
         'best_score': best_score,

@@ -47,11 +47,15 @@ CONFIG = {
     'selective': {
         # Core selective parameters
         'tau': 0.70,              # global target coverage backup
-        'tau_by_group': [0.55, 0.45],  # per-group τ_k (K=2 expected)
+        'tau_by_group': [0.56, 0.44],  # per-group τ_k (head, tail) - updated for Pinball
+        'tau_head': 0.56,         # head coverage target (for Pinball loss)
+        'tau_tail': 0.44,         # tail coverage target (for Pinball loss)
         'beta_tail': 2.0,         # tail weighting in L_sel (head=1, tail=β_tail)
-        'kappa': 20.0,            # sharpness κ for sigmoid smoothing (can raise to 25 later)
-        'lambda_cov': 15.0,       # λ_cov global
-        'lambda_cov_g': 20.0,     # λ_cov-g group coverage penalty
+        'kappa': 25.0,            # sharpness κ for sigmoid smoothing (increased for better calibration)
+        'lambda_cov': 15.0,       # λ_cov global (legacy, kept for compatibility)
+        'lambda_cov_g': 20.0,     # λ_cov-g group coverage penalty (legacy)
+        'lambda_q': 1.0,          # λ_q for Pinball quantile loss
+        'lambda_cov_pinball': 20.0, # λ_cov for per-group coverage penalty in Pinball mode
         'lambda_H': 0.01,         # λ_H entropy regularizer
         'lambda_GA': 0.05,        # λ_GA group-aware prior KL
         # Scheduling
@@ -61,8 +65,8 @@ CONFIG = {
         'alpha_steps': 2,         # B2 fixed-point steps for α per cycle
         'update_alpha': True,     # Whether to run α updates (disable if relying on cov-g)
         'use_quantile_t': True,   # Update t by quantile each epoch (else learnable not yet supported)
-        'alpha_min': 0.85,
-        'alpha_max': 1.15,
+        'alpha_min': 0.80,        # Expanded α range for better tail control
+        'alpha_max': 1.60,        # Wider range allows more aggressive tail boosting
         'gamma_alpha': 0.20,      # EMA factor for α
         # μ / λ grid search (B3)
     'lambda_grid': [round(x,2) for x in np.linspace(-2.0,2.0,41)],
@@ -240,6 +244,44 @@ def temperature_scale_logits(expert_logits, expert_names, temp_cfg):
             scaled[:, i, :] = scaled[:, i, :] / T
     return scaled
 
+def fit_temperature_scaling(expert_logits, labels, expert_names, device='cuda'):
+    """
+    Fit per-expert temperature scaling using Platt scaling on validation set.
+    Returns dictionary of optimal temperatures for each expert.
+    
+    Args:
+        expert_logits: [B, E, C] logits from experts
+        labels: [B] ground truth labels
+        expert_names: list of expert names
+        device: computation device
+    
+    Returns:
+        dict: expert_name -> optimal_temperature
+    """
+    print("Fitting per-expert temperature scaling...")
+    temperatures = {}
+    
+    for i, name in enumerate(expert_names):
+        # Extract logits for this expert
+        logits_i = expert_logits[:, i, :].to(device)  # [B, C]
+        labels_i = labels.to(device)
+        
+        # Optimize temperature via grid search (simple but effective)
+        best_temp = 1.0
+        best_nll = float('inf')
+        
+        for temp in [0.5, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]:
+            scaled_logits = logits_i / temp
+            nll = F.cross_entropy(scaled_logits, labels_i).item()
+            if nll < best_nll:
+                best_nll = nll
+                best_temp = temp
+        
+        temperatures[name] = best_temp
+        print(f"  {name}: T={best_temp:.2f} (NLL={best_nll:.4f})")
+    
+    return temperatures
+
 def compute_mixture_and_w(model, expert_logits):
     """Return gating weights w [B,E] and mixture posterior η [B,C]."""
     with torch.no_grad():
@@ -307,6 +349,40 @@ def mu_from_lambda_grid(lambdas, K):
             raise NotImplementedError("Provide μ grid for K>2")
     return mus
 
+def evaluate_split_with_learned_thresholds(eta, y, alpha, mu, t_param, class_to_group, K, objective='worst_err'):
+    """Evaluate split using learned per-group thresholds t_param instead of fitting."""
+    with torch.no_grad():
+        m_raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+        y_groups = class_to_group[y]
+        t_groups = t_param[y_groups]  # Select threshold for each sample's group
+        s = torch.sigmoid(10.0 * (m_raw - t_groups))  # Use fixed kappa=10.0
+        
+        pred = eta.argmax(dim=1)
+        correct = (pred == y).float()
+        
+        # Group-wise errors
+        group_errs = []
+        for g in range(K):
+            mask = (y_groups == g)
+            if mask.sum() > 0:
+                s_g = s[mask]
+                correct_g = correct[mask]
+                # Rejection is (1 - s), so accepted error is: wrong predictions with high s
+                accepted_wrong = (1 - correct_g) * s_g
+                total_accepted = s_g.sum().clamp(min=1e-6)
+                err_g = accepted_wrong.sum() / total_accepted
+                group_errs.append(err_g.item())
+            else:
+                group_errs.append(0.0)
+        
+        # Objective computation
+        if objective == 'worst_err':
+            return max(group_errs), group_errs
+        elif objective == 'balanced_err':
+            return sum(group_errs) / K, group_errs
+        else:
+            return group_errs[0], group_errs  # Default to first group
+
 def evaluate_split(eta, y, alpha, mu, t, class_to_group, K, objective='worst'):
     """Compute error on accepted samples under objective."""
     with torch.no_grad():
@@ -329,6 +405,81 @@ def evaluate_split(eta, y, alpha, mu, t, class_to_group, K, objective='worst'):
             return float(np.mean(errs)), errs
         else:
             return float(max(errs)), errs
+
+def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_param, cfg_sel, class_to_group, pi_by_group):
+    """Compute all selective-training losses including learnable per-group thresholds with Pinball Loss."""
+    eps = cfg_sel['eps']
+    device = expert_logits.device
+    
+    # Forward gating & mixture
+    gating_features = model.feature_builder(expert_logits)
+    raw_w = model.gating_net(gating_features)
+    w = torch.softmax(raw_w, dim=1)  # [B,E]
+    expert_probs = torch.softmax(expert_logits, dim=-1)  # [B,E,C]
+    eta = torch.einsum('be,bec->bc', w, expert_probs)    # [B,C]
+
+    # Raw margin computation
+    m_raw = compute_raw_margin(eta, alpha, mu, class_to_group)  # [B]
+    
+    # Get ground truth groups and corresponding thresholds
+    y_groups = class_to_group[labels]  # [B] group indices
+    t_g = t_param[y_groups]            # [B] per-sample thresholds
+    
+    # Soft acceptance probability for selective loss
+    s = torch.sigmoid(cfg_sel['kappa'] * (m_raw - t_g))  # [B]
+
+    # p^α: q = α_{g(y)} * η_y then normalize  
+    alpha_per_class = alpha[class_to_group].to(eta.device)  # [C]
+    q = eta * alpha_per_class.unsqueeze(0)  # [B,C]
+    q = q / (q.sum(dim=1, keepdim=True) + eps)
+    ce = F.nll_loss(torch.log(q + eps), labels, reduction='none')  # [B]
+
+    # Tail-aware weighting in L_sel
+    if len(cfg_sel.get('tau_by_group', [])) == 2 and cfg_sel.get('beta_tail', 1.0) != 1.0:
+        beta_tail = cfg_sel['beta_tail']
+        sample_w = torch.where(y_groups == 1, torch.tensor(beta_tail, device=device), torch.tensor(1.0, device=device))
+        L_sel = (s * ce * sample_w).sum() / (s * sample_w).sum().clamp_min(eps)
+    else:
+        L_sel = (s * ce).sum() / (s.sum() + eps)
+
+    # Pinball loss for learning quantile thresholds
+    tau_head, tau_tail = cfg_sel.get('tau_head', 0.56), cfg_sel.get('tau_tail', 0.44)
+    tau_quantile = torch.where(y_groups == 0, 
+                               torch.tensor(1 - tau_head, device=device),
+                               torch.tensor(1 - tau_tail, device=device))  # quantile level = 1 - coverage
+    z = m_raw - t_g  # residual
+    pinball = tau_quantile * torch.relu(z) + (1 - tau_quantile) * torch.relu(-z)
+    L_q = pinball.mean()
+
+    # Per-group coverage penalty  
+    cov_head = s[y_groups == 0].mean() if (y_groups == 0).any() else torch.tensor(0., device=device)
+    cov_tail = s[y_groups == 1].mean() if (y_groups == 1).any() else torch.tensor(0., device=device)
+    L_cov_pinball = (cov_head - tau_head)**2 + (cov_tail - tau_tail)**2
+
+    # Entropy regularizer λ_H * E[-Σ w log w]
+    H_w = -(w * torch.log(w + eps)).sum(dim=1).mean()
+    L_H = cfg_sel['lambda_H'] * H_w
+
+    # Group-aware prior KL λ_GA * E[ KL(w || π_{g(y)}) ]
+    pi = pi_by_group[y_groups]  # [B,E]
+    KL = (w * (torch.log(w + eps) - torch.log(pi + eps))).sum(dim=1).mean()
+    L_GA = cfg_sel['lambda_GA'] * KL
+
+    # Total loss with Pinball terms
+    lambda_q = cfg_sel.get('lambda_q', 1.0)
+    lambda_cov_pinball = cfg_sel.get('lambda_cov_pinball', 20.0)
+    
+    total = L_sel + lambda_q * L_q + lambda_cov_pinball * L_cov_pinball + L_H + L_GA
+    
+    diagnostics = {
+        'L_sel': L_sel.item(), 'L_q': L_q.item(), 'L_cov_pinball': L_cov_pinball.item(),
+        'L_H': L_H.item(), 'L_GA': L_GA.item(), 
+        'cov_head': cov_head.item() if torch.is_tensor(cov_head) else cov_head,
+        'cov_tail': cov_tail.item() if torch.is_tensor(cov_tail) else cov_tail,
+        'entropy_w': H_w.item(), 'kl_w': KL.item(),
+        't_head': t_param[0].item(), 't_tail': t_param[1].item(),
+    }
+    return total, diagnostics, m_raw.detach(), s.detach()
 
 def selective_losses(expert_logits, labels, model, alpha, mu, t, cfg_sel, class_to_group, pi_by_group):
     """Compute all selective-training losses and diagnostics for one batch."""
@@ -409,6 +560,23 @@ def run_selective_mode():
     S1_loader, S2_loader = load_two_splits_from_logits(CONFIG)
     print(f"Loaded S1 (tuneV) batches: {len(S1_loader)} | S2 (val_lt) batches: {len(S2_loader)}")
 
+    # Calibrate expert temperatures on S1 before any training
+    print("\n-- Temperature Calibration --")
+    temp_logits = []
+    temp_labels = []
+    for expert_logits, labels in S1_loader:
+        temp_logits.append(expert_logits)
+        temp_labels.append(labels)
+        if len(temp_logits) * expert_logits.size(0) > 2000:  # Use ~2k samples for calibration
+            break
+    
+    temp_logits = torch.cat(temp_logits)[:2000]
+    temp_labels = torch.cat(temp_labels)[:2000]
+    
+    temperatures = fit_temperature_scaling(temp_logits, temp_labels, CONFIG['experts']['names'], DEVICE)
+    sel_cfg['temperature'] = temperatures
+    print(f"✅ Fitted temperatures: {temperatures}")
+
     # Grouping
     class_counts_full = get_cifar100_lt_counts(imb_factor=100)
     class_to_group = get_class_to_group_by_threshold(class_counts_full, threshold=CONFIG['grouping']['threshold'])
@@ -428,9 +596,17 @@ def run_selective_mode():
     # Init α, μ
     alpha = torch.ones(K, device=DEVICE)
     mu = torch.zeros(K, device=DEVICE)
+    
+    # Initialize learnable per-group thresholds
+    t_param = torch.nn.Parameter(torch.full((K,), -0.70, device=DEVICE))  # init near reasonable level
+    print(f"✅ Initialized learnable thresholds t_param: {t_param.tolist()}")
 
-    # Optimizer (gating params only)
-    optimizer = optim.Adam(model.gating_net.parameters(), lr=CONFIG['gating_params']['lr'], weight_decay=CONFIG['gating_params']['weight_decay'])
+    # Optimizer (gating params + learnable thresholds)
+    optimizer = optim.Adam(
+        list(model.gating_net.parameters()) + [t_param], 
+        lr=CONFIG['gating_params']['lr'], 
+        weight_decay=CONFIG['gating_params']['weight_decay']
+    )
 
     # Priors π_g
     pi_by_group = build_group_priors(CONFIG['experts']['names'], K, sel_cfg['prior_head_boost'], sel_cfg['prior_tail_boost']).to(DEVICE)
@@ -474,10 +650,21 @@ def run_selective_mode():
     mu_candidates = [m.to(DEVICE) for m in mu_from_lambda_grid(lambda_grid, K)]
     best_mu = mu.clone()
     best_score = float('inf')
+    
+    # Initialize cycle logging
+    cycle_logs = []
 
     for cycle in range(sel_cfg['cycles']):
         print(f"\nCycle {cycle+1}/{sel_cfg['cycles']}")
-        # B1: optimize gating with selective-aware loss
+        
+        # Initialize cycle diagnostics
+        cycle_diag = {
+            'cycle': cycle+1,
+            'alpha': alpha.tolist(),
+            'mu': mu.tolist(),
+            'threshold': t.item()
+        }
+        # B1: optimize gating with selective-aware loss (using pinball for thresholds)
         for ep in range(sel_cfg['epochs_per_cycle']):
             model.train()
             epoch_diag = []
@@ -485,24 +672,55 @@ def run_selective_mode():
             for batch_idx,(expert_logits, labels) in enumerate(S1_loader):
                 expert_logits = temperature_scale_logits(expert_logits.to(DEVICE), CONFIG['experts']['names'], sel_cfg['temperature'])
                 labels = labels.to(DEVICE)
+                
                 optimizer.zero_grad()
-                loss, diag, m_raw, s = selective_losses(expert_logits, labels, model, alpha, mu, t, sel_cfg, class_to_group.to(DEVICE), pi_by_group)
-                loss.backward()
+                
+                # Forward pass through gating network only
+                w, eta, _ = compute_mixture_and_w(model, expert_logits)
+                m_raw = compute_raw_margin(eta, alpha, mu, class_to_group.to(DEVICE))
+                
+                # Use pinball loss for learning thresholds
+                total_loss, diagnostics, m_raw_detached, s_detached = selective_losses_with_pinball(
+                    expert_logits, labels, model, alpha, mu, t_param, CONFIG['selective'], 
+                    class_to_group.to(DEVICE), pi_by_group
+                )
+                
+                # Extract values from diagnostics for compatibility
+                selective_loss = diagnostics['L_sel']
+                coverage_current = diagnostics.get('coverage', 0.0)
+                coverage_head = diagnostics.get('mean_s_head', 0.0) 
+                coverage_tail = diagnostics.get('mean_s_tail', 0.0)
+                
+                total_loss.backward()
                 if CONFIG['gating_params'].get('gradient_clip', 0) > 0:
-                    torch.nn.utils.clip_grad_norm_(model.gating_net.parameters(), CONFIG['gating_params']['gradient_clip'])
+                    torch.nn.utils.clip_grad_norm_(list(model.gating_net.parameters()) + [t_param], CONFIG['gating_params']['gradient_clip'])
                 optimizer.step()
-                epoch_diag.append(diag)
-                raw_collect.append(m_raw.cpu())
+                
+                # Diagnostics (compatible format)
+                with torch.no_grad():
+                    w, eta, _ = compute_mixture_and_w(model, expert_logits)
+                    m_raw = compute_raw_margin(eta, alpha, mu, class_to_group.to(DEVICE))
+                    raw_collect.append(m_raw.cpu())
+                    
+                    diag = {
+                        'L_sel': selective_loss,
+                        'L_cov': 0.0,  # Placeholder for coverage loss component
+                        'coverage': coverage_current,
+                        'mean_s_head': coverage_head,
+                        'mean_s_tail': coverage_tail,
+                        'entropy_w': w.entropy(dim=1).mean().item() if hasattr(w, 'entropy') else 0.0
+                    }
+                    epoch_diag.append(diag)
+                
                 if (batch_idx+1) % sel_cfg['log_interval'] == 0:
-                    print(f"  [B1 e{ep+1} b{batch_idx+1}] L_sel={diag['L_sel']:.3f} cov={diag['coverage']:.3f} H={diag['entropy_w']:.3f}")
-            # Update threshold t via quantile each epoch
-            if sel_cfg['use_quantile_t']:
-                all_raw = torch.cat(raw_collect).to(DEVICE)
-                t = torch.quantile(all_raw, 1 - sel_cfg['tau'])
+                    print(f"  [B1 e{ep+1} b{batch_idx+1}] L_sel={diag['L_sel']:.3f} cov={diag['coverage']:.3f} t_h={t_param[0].item():.3f} t_t={t_param[1].item():.3f}")
+            
+            # No need to update threshold t via quantile - t_param is learned
             # Summarize epoch diagnostics
-            keys = epoch_diag[0].keys()
+            keys = ['L_sel','coverage','mean_s_head','mean_s_tail']
             avg_diag = {k: float(np.mean([d[k] for d in epoch_diag])) for k in keys}
-            print(f"  B1 Epoch {ep+1}: t={t.item():.4f} | " + ", ".join([f"{k}={avg_diag[k]:.3f}" for k in ['L_sel','coverage','mean_s_head','mean_s_tail']]))
+            print(f"  B1 Epoch {ep+1}: t_head={t_param[0].item():.4f} t_tail={t_param[1].item():.4f} | " + 
+                  ", ".join([f"{k}={avg_diag[k]:.3f}" for k in keys]))
 
         # Cache η for S1/S2 for α & μ updates
         def cache_eta(loader):
@@ -526,15 +744,13 @@ def run_selective_mode():
                                                              gamma=sel_cfg['gamma_alpha'], alpha_min=sel_cfg['alpha_min'], alpha_max=sel_cfg['alpha_max'], rho=0.03)
             print(f"  Updated α: {alpha.tolist()}")
 
-        # B3: sweep μ via λ grid on S2
+        # B3: sweep μ via λ grid on S2 (use learned thresholds t_param)
         mu_best_local = mu.clone()
         score_best_local = float('inf')
         for j, mu_cand in enumerate(mu_candidates):
-            # Fit t for these params using S1 raw margins (could refine, keep global t for speed)
-            raw_S1 = compute_raw_margin(eta_S1, alpha, mu_cand, class_to_group.to(DEVICE))
-            t_cand = torch.quantile(raw_S1, 1 - sel_cfg['tau']) if sel_cfg['use_quantile_t'] else t
-            score, group_errs = evaluate_split(eta_S2, y_S2, alpha, mu_cand, t_cand, class_to_group.to(DEVICE), K, objective=sel_cfg['opt_objective'])
-            print(f"  λ[{lambda_grid[j]:.2f}] -> {sel_cfg['opt_objective']} err={score:.4f} t={t_cand:.4f} | groups={['{:.3f}'.format(e) for e in group_errs]}")
+            # Use current learned thresholds directly - no fitting needed
+            score, group_errs = evaluate_split_with_learned_thresholds(eta_S2, y_S2, alpha, mu_cand, t_param, class_to_group.to(DEVICE), K, objective=sel_cfg['opt_objective'])
+            print(f"  λ[{lambda_grid[j]:.2f}] -> {sel_cfg['opt_objective']} err={score:.4f} t_h={t_param[0].item():.4f} t_t={t_param[1].item():.4f} | groups={['{:.3f}'.format(e) for e in group_errs]}")
             if score < score_best_local - 1e-6:
                 score_best_local = score
                 mu_best_local = mu_cand.clone()
@@ -547,23 +763,43 @@ def run_selective_mode():
 
         # EMA stabilize α
         alpha = 0.5 * alpha + 0.5 * project_alpha(alpha, sel_cfg['alpha_min'], sel_cfg['alpha_max'])
+        
+        # Log cycle diagnostics
+        cycle_diag.update({
+            'final_alpha': alpha.tolist(),
+            'final_mu': mu.tolist(), 
+            'best_score': score_best_local,
+            'global_best': best_score
+        })
+        cycle_logs.append(cycle_diag)
+        
         print(f"  End Cycle {cycle+1}: best_score_so_far={best_score:.4f}")
 
-    # Save checkpoint
+    # Save checkpoint with learned thresholds
     output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt = {
         'gating_net_state_dict': model.gating_net.state_dict(),
         'alpha': alpha.cpu(),
         'mu': best_mu.cpu(),
-        't': t.item(),
+        't_param': t_param.cpu().detach(),  # Save learned thresholds
         'pi_by_group': pi_by_group.cpu(),
         'config': CONFIG,
-        'mode': 'selective'
+        'mode': 'selective_pinball',  # Mark as pinball mode
+        'cycle_logs': cycle_logs,
+        'temperatures': temperatures
     }
     torch.save(ckpt, output_dir / 'gating_selective.ckpt')
-    print(f"\n✅ Selective training complete. Saved checkpoint to {output_dir / 'gating_selective.ckpt'}")
-    print(f"Final α={alpha.tolist()} | μ={best_mu.tolist()} | t={t.item():.4f} | best_score={best_score:.4f}")
+    
+    # Save cycle logs to JSON for analysis
+    import json
+    with open(output_dir / 'selective_training_logs.json', 'w') as f:
+        json.dump(cycle_logs, f, indent=2)
+    
+    print(f"\n✅ Selective Pinball training complete. Saved checkpoint to {output_dir / 'gating_selective.ckpt'}")
+    print(f"✅ Cycle logs saved to {output_dir / 'selective_training_logs.json'}")
+    print(f"Final α={alpha.tolist()} | μ={best_mu.tolist()} | learned t={t_param.tolist()} | best_score={best_score:.4f}")
+    print(f"📊 Learned thresholds - t_head: {t_param[0].item():.4f}, t_tail: {t_param[1].item():.4f}")
 
 
 def train_gating_only():

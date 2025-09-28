@@ -25,6 +25,8 @@ def fit_group_thresholds_from_raw(raw_margins, pred_groups, target_cov_by_group,
             t_k[k] = torch.quantile(raw_margins, 1.0 - avg_tau)
             print(f"⚠️ No samples predicted for group {k}, using global threshold {t_k[k]:.4f}")
         else:
+            # Ensure mask and raw margins are on same device
+            mk = mk.to(raw_margins.device)
             t_k[k] = torch.quantile(raw_margins[mk], 1.0 - target_cov_by_group[k])
             print(f"Group {k}: n={mk.sum().item()} τ_k={target_cov_by_group[k]:.3f} -> t_k={t_k[k]:.4f}")
     return t_k

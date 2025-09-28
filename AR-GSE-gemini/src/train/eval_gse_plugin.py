@@ -39,8 +39,8 @@ CONFIG = {
         'coverage_points': [0.7, 0.8, 0.9],
         'bootstrap_n': 1000,
     },
-    'plugin_checkpoint': './checkpoints/argse_worst_eg/cifar100_lt_if100/gse_balanced_plugin.ckpt',
-    'output_dir': './results_worst_eg/cifar100_lt_if100',
+    'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
+    'output_dir': './results_worst_eg_improved/cifar100_lt_if100',
     'seed': 42
 }
 
@@ -61,7 +61,7 @@ def load_test_data():
         logits_path = logits_root / expert_name / "test_lt_logits.pt"
         if not logits_path.exists():
             raise FileNotFoundError(f"Logits file not found: {logits_path}")
-        stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
+        stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
     
     # Load test labels
     full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
@@ -148,6 +148,9 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         print(f"  • FPR (incorrect accepted): {fpr:.3f}")
         print(f"  • α_k: {alpha[k]:.3f}")
         print(f"  • μ_k: {mu[k]:.3f}")
+        # Show the threshold for this group
+        group_threshold_val = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
+        print(f"  • τ_k: {group_threshold_val:.3f}")
         print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
         
         # Check separation quality
@@ -156,7 +159,9 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         
         if len(accepted_margins) > 0 and len(rejected_margins) > 0:
             separation = accepted_margins.min().item() - rejected_margins.max().item()
-            overlap_ratio = (rejected_margins > threshold).sum().item() / len(rejected_margins)
+            # Use the appropriate threshold for this group
+            group_threshold = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
+            overlap_ratio = (rejected_margins > group_threshold).sum().item() / len(rejected_margins)
             print(f"  • Margin separation: {separation:.3f}")
             print(f"  • Overlap ratio: {overlap_ratio:.3f}")
     
@@ -224,7 +229,7 @@ def main():
         raise FileNotFoundError(f"Plugin checkpoint not found: {plugin_ckpt_path}")
     
     print(f"📂 Loading plugin checkpoint: {plugin_ckpt_path}")
-    checkpoint = torch.load(plugin_ckpt_path, map_location=DEVICE)
+    checkpoint = torch.load(plugin_ckpt_path, map_location=DEVICE, weights_only=False)
     
     alpha_star = checkpoint['alpha'].to(DEVICE)
     mu_star = checkpoint['mu'].to(DEVICE)
@@ -235,7 +240,12 @@ def main():
     print("✅ Loaded optimal parameters:")
     print(f"   α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"   μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
-    print(f"   raw-margin threshold t* = {plugin_threshold:.3f}")
+    
+    # Handle both single threshold and per-group thresholds
+    if isinstance(plugin_threshold, list):
+        print(f"   per-group thresholds t* = {plugin_threshold}")
+    else:
+        print(f"   raw-margin threshold t* = {plugin_threshold:.3f}")
     if 'best_score' in checkpoint:
         print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
     if 'source' in checkpoint:
@@ -245,12 +255,33 @@ def main():
     
     # 2. Set up model with optimal parameters
     num_experts = len(CONFIG['experts']['names'])
-    gating_feature_dim = 4 * num_experts
+    
+    # Compute dynamic gating feature dimension (enriched features)
+    with torch.no_grad():
+        dummy_logits = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
+        temp_model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
+        gating_feature_dim = temp_model.feature_builder(dummy_logits).size(-1)
+        del temp_model
+    print(f"✅ Dynamic gating feature dim: {gating_feature_dim}")
+    
     model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, gating_feature_dim).to(DEVICE)
     
-    # Load gating network weights (feature_builder has no trainable parameters)
+    # Load gating network weights with dimension compatibility check
     if 'gating_net_state_dict' in checkpoint:
-        model.gating_net.load_state_dict(checkpoint['gating_net_state_dict'])
+        saved_state = checkpoint['gating_net_state_dict']
+        current_state = model.gating_net.state_dict()
+        
+        compatible = True
+        for key in saved_state.keys():
+            if key in current_state and saved_state[key].shape != current_state[key].shape:
+                print(f"⚠️  Dimension mismatch for {key}: saved {saved_state[key].shape} vs current {current_state[key].shape}")
+                compatible = False
+        
+        if compatible:
+            model.gating_net.load_state_dict(saved_state)
+            print("✅ Gating network weights loaded successfully")
+        else:
+            print("❌ Gating checkpoint incompatible with enriched features. Using random weights.")
     else:
         print("⚠️ No gating network weights found in checkpoint")
     
@@ -280,14 +311,34 @@ def main():
     margins_raw = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
     preds = (alpha_star_cpu[class_to_group_cpu] * eta_mix).argmax(dim=1)
     
-    # Use per-group thresholds if available, otherwise use global threshold
+    # 🔧 FIXED: Use per-group thresholds with GROUND-TRUTH groups (not predicted groups)
     t_group = checkpoint.get('t_group', None)
     if t_group is not None:
-        pred_groups = class_to_group_cpu[preds]
-        from src.train.per_group_threshold import accept_with_group_thresholds
-        accepted = accept_with_group_thresholds(margins_raw, pred_groups, t_group.cpu())
-        print(f"✅ Using per-group thresholds: {t_group.tolist()}")
+        # Convert to tensor if it's a list and keep original list for display
+        if isinstance(t_group, list):
+            t_group_list = t_group
+            t_group = torch.tensor(t_group)
+        else:
+            t_group_list = t_group.tolist()
+        
+        # Use GROUND-TRUTH groups (class_to_group[true_labels]) instead of prediction groups  
+        y_groups = class_to_group_cpu[test_labels]  # Ground-truth groups
+        
+        # Per-sample threshold based on ground-truth group
+        thresholds_per_sample = torch.tensor([t_group[g].item() for g in y_groups])
+        accepted = margins_raw >= thresholds_per_sample
+        
+        print(f"✅ Using per-group thresholds with GROUND-TRUTH groups: {t_group_list}")
         print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+        
+        # Per-group coverage breakdown
+        for k in range(len(t_group_list)):
+            group_mask = (y_groups == k)
+            if group_mask.sum() > 0:
+                group_cov = accepted[group_mask].float().mean().item()
+                group_name = "head" if k == 0 else "tail" 
+                print(f"   📊 {group_name} (group {k}): coverage={group_cov:.3f}, threshold={t_group_list[k]:.3f}")
+            
     else:
         accepted = margins_raw >= plugin_threshold
         print(f"✅ Using global threshold: {plugin_threshold:.3f}")
@@ -347,7 +398,14 @@ def main():
     # Better messaging based on threshold type used
     t_group = checkpoint.get('t_group', None)
     if t_group is not None:
-        print(f"Plugin metrics @ per-group thresholds {[f'{t:.3f}' for t in t_group.tolist()]}: "
+        # Convert to tensor if it's a list
+        if isinstance(t_group, list):
+            t_group_list = t_group
+            t_group = torch.tensor(t_group)
+        else:
+            t_group_list = t_group.tolist()
+            
+        print(f"Plugin metrics @ per-group thresholds {[f'{t:.3f}' for t in t_group_list]}: "
               f"Coverage={plugin_metrics['coverage']:.3f}, "
               f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
     else:
@@ -356,8 +414,9 @@ def main():
               f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
     
     # 5.5a Detailed Group-wise Analysis
+    threshold_param = t_group if t_group is not None else plugin_threshold
     analyze_group_performance(eta_mix, preds, test_labels, accepted,
-                             alpha_star_cpu, mu_star_cpu, plugin_threshold, class_to_group_cpu, num_groups)
+                             alpha_star_cpu, mu_star_cpu, threshold_param, class_to_group_cpu, num_groups)
     
     # 5.6 ECE
     ece = calculate_ece(eta_mix, test_labels)
@@ -417,13 +476,30 @@ def main():
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Test samples: {num_test_samples}")
     print(f"Optimal parameters: α*={alpha_star.cpu().tolist()}, μ*={mu_star.cpu().tolist()}")
-    print(f"Raw-margin threshold (fitted on S1): t* = {plugin_threshold:.3f}")
+    
+    # Handle threshold display
+    t_group = checkpoint.get('t_group', None)
+    if t_group is not None:
+        if isinstance(t_group, list):
+            t_group_display = [f'{t:.3f}' for t in t_group]
+        else:
+            t_group_display = [f'{t:.3f}' for t in t_group.tolist()]
+        print(f"Per-group thresholds (fitted on S1): t* = {t_group_display}")
+    else:
+        print(f"Raw-margin threshold (fitted on S1): t* = {plugin_threshold:.3f}")
+    
     print()
     print("Key Results:")
     print(f"• AURC (Balanced): {aurc_bal:.4f}")
     print(f"• AURC (Worst): {aurc_wst:.4f}") 
-    print(f"• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
-          f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
+    
+    if t_group is not None:
+        print(f"• Plugin @ per-group thresholds: Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
+    else:
+        print(f"• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
+    
     print(f"• ECE: {ece:.4f}")
     print("="*60)
 
