@@ -18,7 +18,7 @@ from src.metrics.calibration import calculate_ece
 from src.metrics.bootstrap import bootstrap_ci
 
 # Import plugin functions
-from src.train.gse_balanced_plugin import compute_margin, accepted_and_pred
+from src.train.gse_balanced_plugin import compute_margin
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -39,8 +39,8 @@ CONFIG = {
         'coverage_points': [0.7, 0.8, 0.9],
         'bootstrap_n': 1000,
     },
-    'plugin_checkpoint': './checkpoints/argse_balanced_plugin/cifar100_lt_if100/gse_balanced_plugin.ckpt',
-    'output_dir': './results_balanced_plugin/cifar100_lt_if100',
+    'plugin_checkpoint': './checkpoints/argse_worst_eg/cifar100_lt_if100/gse_balanced_plugin.ckpt',
+    'output_dir': './results_worst_eg/cifar100_lt_if100',
     'seed': 42
 }
 
@@ -86,6 +86,82 @@ def get_mixture_posteriors(model, logits):
         eta_mix = torch.einsum('be,bec->bc', gating_weights, expert_posteriors)  # [B, C]
         
     return eta_mix.cpu()
+
+def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, threshold, class_to_group, K):
+    """
+    Analyze detailed per-group performance metrics.
+    """
+    print("\n" + "="*50)
+    print("DETAILED GROUP-WISE ANALYSIS")
+    print("="*50)
+    
+    # Ensure all tensors are on same device
+    device = eta_mix.device
+    class_to_group = class_to_group.to(device)
+    y_groups = class_to_group[labels]
+    
+    for k in range(K):
+        group_name = "Head" if k == 0 else "Tail"
+        group_mask = (y_groups == k)
+        group_size = group_mask.sum().item()
+        
+        if group_size == 0:
+            continue
+            
+        # Coverage and error for this group
+        group_accepted = accepted[group_mask]
+        group_coverage = group_accepted.float().mean().item()
+        
+        # TPR/FPR analysis for this group
+        group_preds_all = preds[group_mask]
+        group_labels_all = labels[group_mask]
+        group_correct = (group_preds_all == group_labels_all)
+        
+        # True Positive Rate (TPR): fraction of correct predictions that are accepted
+        correct_accepted = group_accepted & group_correct
+        tpr = correct_accepted.sum().item() / group_correct.sum().item() if group_correct.sum() > 0 else 0.0
+        
+        # False Positive Rate (FPR): fraction of incorrect predictions that are accepted  
+        incorrect_accepted = group_accepted & (~group_correct)
+        fpr = incorrect_accepted.sum().item() / (~group_correct).sum().item() if (~group_correct).sum() > 0 else 0.0
+        
+        if group_accepted.sum() > 0:
+            group_preds = preds[group_mask & accepted]
+            group_labels = labels[group_mask & accepted]
+            group_accuracy = (group_preds == group_labels).float().mean().item()
+            group_error = 1.0 - group_accuracy
+        else:
+            group_error = 1.0
+            
+        # Raw margin statistics for this group
+        raw_margins = compute_margin(eta_mix[group_mask], alpha, mu, 0.0, class_to_group)
+        margin_mean = raw_margins.mean().item()
+        margin_std = raw_margins.std().item()
+        margin_min = raw_margins.min().item()
+        margin_max = raw_margins.max().item()
+        
+        print(f"\n{group_name} Group (k={k}):")
+        print(f"  • Size: {group_size} samples")
+        print(f"  • Coverage: {group_coverage:.3f}")
+        print(f"  • Error: {group_error:.3f}")
+        print(f"  • TPR (correct accepted): {tpr:.3f}")
+        print(f"  • FPR (incorrect accepted): {fpr:.3f}")
+        print(f"  • α_k: {alpha[k]:.3f}")
+        print(f"  • μ_k: {mu[k]:.3f}")
+        print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
+        
+        # Check separation quality
+        accepted_margins = raw_margins[group_accepted]
+        rejected_margins = raw_margins[~group_accepted]
+        
+        if len(accepted_margins) > 0 and len(rejected_margins) > 0:
+            separation = accepted_margins.min().item() - rejected_margins.max().item()
+            overlap_ratio = (rejected_margins > threshold).sum().item() / len(rejected_margins)
+            print(f"  • Margin separation: {separation:.3f}")
+            print(f"  • Overlap ratio: {overlap_ratio:.3f}")
+    
+    print("\n" + "="*50)
+
 
 def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_group, K, kind="balanced"):
     """
@@ -154,13 +230,18 @@ def main():
     mu_star = checkpoint['mu'].to(DEVICE)
     class_to_group = checkpoint['class_to_group'].to(DEVICE)
     num_groups = checkpoint['num_groups']
-    threshold = checkpoint.get('threshold', checkpoint.get('c'))  # Backward compatibility
+    plugin_threshold = checkpoint.get('threshold', checkpoint.get('c'))  # Backward compatibility
     
     print("✅ Loaded optimal parameters:")
     print(f"   α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"   μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
-    print(f"   raw-margin threshold t* = {threshold:.3f}")
-    print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
+    print(f"   raw-margin threshold t* = {plugin_threshold:.3f}")
+    if 'best_score' in checkpoint:
+        print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
+    if 'source' in checkpoint:
+        print(f"   Source: {checkpoint['source']}")
+    if 'improvement' in checkpoint:
+        print(f"   Expected improvement: {checkpoint['improvement']:.1f}%")
     
     # 2. Set up model with optimal parameters
     num_experts = len(CONFIG['experts']['names'])
@@ -190,19 +271,34 @@ def main():
     print("🔮 Computing test predictions...")
     eta_mix = get_mixture_posteriors(model, test_logits)
     
-    # Compute margins and predictions using plugin functions
-    margins_raw = compute_margin(eta_mix, alpha_star.cpu(), mu_star.cpu(), 0.0, class_to_group.cpu())
+    # Ensure all tensors are on CPU for consistent computation
+    alpha_star_cpu = alpha_star.cpu()
+    mu_star_cpu = mu_star.cpu()
+    class_to_group_cpu = class_to_group.cpu()
     
-    accepted, preds, _ = accepted_and_pred(eta_mix, alpha_star.cpu(), mu_star.cpu(), threshold, class_to_group.cpu())
+    # Compute raw margins and predictions
+    margins_raw = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    preds = (alpha_star_cpu[class_to_group_cpu] * eta_mix).argmax(dim=1)
     
-    print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+    # Use per-group thresholds if available, otherwise use global threshold
+    t_group = checkpoint.get('t_group', None)
+    if t_group is not None:
+        pred_groups = class_to_group_cpu[preds]
+        from src.train.per_group_threshold import accept_with_group_thresholds
+        accepted = accept_with_group_thresholds(margins_raw, pred_groups, t_group.cpu())
+        print(f"✅ Using per-group thresholds: {t_group.tolist()}")
+        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+    else:
+        accepted = margins_raw >= plugin_threshold
+        print(f"✅ Using global threshold: {plugin_threshold:.3f}")
+        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
     
     # 5. Calculate metrics
     print("📈 Calculating metrics...")
     results = {}
     
     # 5.1 RC Curve and AURC (using raw margins for fair comparison)
-    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group.cpu(), num_groups)
+    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
     rc_df.to_csv(output_dir / 'rc_curve.csv', index=False)
     
     aurc_bal = calculate_aurc(rc_df, 'balanced_error')
@@ -212,7 +308,7 @@ def main():
     print(f"AURC (Balanced): {aurc_bal:.4f}, AURC (Worst): {aurc_wst:.4f}")
     
     # 5.2 RC Curve 0.2-1.0 range
-    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group.cpu(), num_groups)
+    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
     rc_df_02.to_csv(output_dir / 'rc_curve_02_10.csv', index=False)
     
     aurc_bal_02 = calculate_aurc_from_02(rc_df_02, 'balanced_error')
@@ -223,7 +319,7 @@ def main():
     
     # 5.3 Bootstrap CI for AURC
     def aurc_metric_func(m, p, labels):
-        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group.cpu(), num_groups, num_points=51)
+        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group_cpu, num_groups, num_points=51)
         return calculate_aurc(rc_df_boot, 'balanced_error')
 
     mean_aurc, lower, upper = bootstrap_ci(
@@ -235,20 +331,33 @@ def main():
     # 5.4 Metrics at fixed coverage points (using raw margins)
     results_at_coverage = {}
     for cov_target in CONFIG['eval_params']['coverage_points']:
-        threshold = torch.quantile(margins_raw, 1.0 - cov_target)
-        accepted_mask = margins_raw >= threshold
+        thr_cov = torch.quantile(margins_raw, 1.0 - cov_target)
+        accepted_mask = margins_raw >= thr_cov   # >= giúp bền vững khi có ties
         
-        metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group.cpu(), num_groups)
+        metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group_cpu, num_groups)
         results_at_coverage[f'cov_{cov_target}'] = metrics
         print(f"Metrics @ {metrics['coverage']:.2f} coverage: "
               f"Bal.Err={metrics['balanced_error']:.4f}, Worst.Err={metrics['worst_error']:.4f}")
     results['metrics_at_coverage'] = results_at_coverage
     
     # 5.5 Plugin-specific metrics (at optimal threshold)
-    plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group.cpu(), num_groups)
+    plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group_cpu, num_groups)
     results['plugin_metrics_at_threshold'] = plugin_metrics
-    print(f"Plugin metrics @ t*={threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
-          f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    
+    # Better messaging based on threshold type used
+    t_group = checkpoint.get('t_group', None)
+    if t_group is not None:
+        print(f"Plugin metrics @ per-group thresholds {[f'{t:.3f}' for t in t_group.tolist()]}: "
+              f"Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    else:
+        print(f"Plugin metrics @ global threshold t*={plugin_threshold:.3f}: "
+              f"Coverage={plugin_metrics['coverage']:.3f}, "
+              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    
+    # 5.5a Detailed Group-wise Analysis
+    analyze_group_performance(eta_mix, preds, test_labels, accepted,
+                             alpha_star_cpu, mu_star_cpu, plugin_threshold, class_to_group_cpu, num_groups)
     
     # 5.6 ECE
     ece = calculate_ece(eta_mix, test_labels)
@@ -260,9 +369,9 @@ def main():
     selective_risks = {}
     for c_cost in [0.3, 0.5, 0.7]:
         bal_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                            class_to_group.cpu(), num_groups, "balanced")
+                                            class_to_group_cpu, num_groups, "balanced")
         worst_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                              class_to_group.cpu(), num_groups, "worst")
+                                              class_to_group_cpu, num_groups, "worst")
         selective_risks[f'cost_{c_cost}'] = {'balanced': bal_risk, 'worst': worst_risk}
         print(f"  Cost c={c_cost:.2f}: Balanced={bal_risk:.4f}, Worst={worst_risk:.4f}")
     results['selective_risks'] = selective_risks
@@ -308,12 +417,12 @@ def main():
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Test samples: {num_test_samples}")
     print(f"Optimal parameters: α*={alpha_star.cpu().tolist()}, μ*={mu_star.cpu().tolist()}")
-    print(f"Raw-margin threshold (fitted on S1): t* = {threshold:.3f}")
+    print(f"Raw-margin threshold (fitted on S1): t* = {plugin_threshold:.3f}")
     print()
     print("Key Results:")
     print(f"• AURC (Balanced): {aurc_bal:.4f}")
     print(f"• AURC (Worst): {aurc_wst:.4f}") 
-    print(f"• Plugin @ t*={threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
+    print(f"• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
           f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
     print(f"• ECE: {ece:.4f}")
     print("="*60)
