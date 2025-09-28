@@ -87,6 +87,67 @@ def get_mixture_posteriors(model, logits):
         
     return eta_mix.cpu()
 
+def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, threshold, class_to_group, K):
+    """
+    Analyze detailed per-group performance metrics.
+    """
+    print("\n" + "="*50)
+    print("DETAILED GROUP-WISE ANALYSIS")
+    print("="*50)
+    
+    # Ensure all tensors are on same device
+    device = eta_mix.device
+    class_to_group = class_to_group.to(device)
+    y_groups = class_to_group[labels]
+    
+    for k in range(K):
+        group_name = "Head" if k == 0 else "Tail"
+        group_mask = (y_groups == k)
+        group_size = group_mask.sum().item()
+        
+        if group_size == 0:
+            continue
+            
+        # Coverage and error for this group
+        group_accepted = accepted[group_mask]
+        group_coverage = group_accepted.float().mean().item()
+        
+        if group_accepted.sum() > 0:
+            group_preds = preds[group_mask & accepted]
+            group_labels = labels[group_mask & accepted]
+            group_accuracy = (group_preds == group_labels).float().mean().item()
+            group_error = 1.0 - group_accuracy
+        else:
+            group_error = 1.0
+            
+        # Raw margin statistics for this group
+        raw_margins = compute_margin(eta_mix[group_mask], alpha, mu, 0.0, class_to_group)
+        margin_mean = raw_margins.mean().item()
+        margin_std = raw_margins.std().item()
+        margin_min = raw_margins.min().item()
+        margin_max = raw_margins.max().item()
+        
+        print(f"\n{group_name} Group (k={k}):")
+        print(f"  • Size: {group_size} samples")
+        print(f"  • Coverage: {group_coverage:.3f}")
+        print(f"  • Error: {group_error:.3f}")
+        print(f"  • α_k: {alpha[k]:.3f}")
+        print(f"  • μ_k: {mu[k]:.3f}")
+        print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
+        
+        # Check separation quality
+        accepted_margins = raw_margins[group_accepted]
+        rejected_margins = raw_margins[~group_accepted]
+        
+        if len(accepted_margins) > 0 and len(rejected_margins) > 0:
+            separation = accepted_margins.min().item() - rejected_margins.max().item()
+            overlap_ratio = (rejected_margins > threshold).sum().item() / len(rejected_margins)
+            print(f"  • Margin separation: {separation:.3f}")
+            print(f"  • Overlap ratio: {overlap_ratio:.3f}")
+    
+    print("\n" + "="*50)
+
+
 def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_group, K, kind="balanced"):
     """
     Compute selective risk with rejection cost c_cost.
@@ -249,6 +310,10 @@ def main():
     results['plugin_metrics_at_threshold'] = plugin_metrics
     print(f"Plugin metrics @ t*={threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
           f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
+    
+    # 5.5a Detailed Group-wise Analysis
+    analyze_group_performance(eta_mix, preds, test_labels, accepted,
+                             alpha_star, mu_star, threshold, class_to_group, num_groups)
     
     # 5.6 ECE
     ece = calculate_ece(eta_mix, test_labels)

@@ -36,12 +36,69 @@ CONFIG = {
         'batch_size': 256,
         'lr': 1e-3,
         'weight_decay': 1e-4,
+        'balanced_training': True,  # Enable tail-aware training
+        'tail_weight': 1.2,  # Reduced from 2.0 to softer weighting
+        'use_freq_weighting': True,  # Use frequency-based soft weighting
+        'entropy_penalty': 0.001,  # Entropy regularization for gating
     },
     'output': {
         'checkpoints_dir': './checkpoints/gating_pretrained/',
     },
     'seed': 42
 }
+
+def mixture_cross_entropy_loss(expert_logits, labels, gating_weights, sample_weights=None, entropy_penalty=0.0):
+    """
+    Cross-entropy loss on mixture of expert predictions with optional sample weighting and entropy penalty.
+    L = -log(Σ_e w_e * softmax(logits_e)[y]) + entropy_penalty * H(gating_weights)
+    """
+    # expert_logits: [B, E, C]
+    # gating_weights: [B, E]  
+    # labels: [B]
+    # sample_weights: [B] optional
+    
+    expert_probs = torch.softmax(expert_logits, dim=-1)  # [B, E, C]
+    mixture_probs = torch.einsum('be,bec->bc', gating_weights, expert_probs)  # [B, C]
+    
+    # Clamp for numerical stability
+    mixture_probs = torch.clamp(mixture_probs, min=1e-7, max=1.0-1e-7)
+    
+    # Cross-entropy: -log(p_y)
+    log_probs = torch.log(mixture_probs)  # [B, C]
+    nll = torch.nn.functional.nll_loss(log_probs, labels, reduction='none')  # [B]
+    
+    # Apply sample weights if provided
+    if sample_weights is not None:
+        nll = nll * sample_weights
+    
+    ce_loss = nll.mean()
+    
+    # Add entropy penalty to encourage diversity in gating weights
+    entropy_loss = 0.0
+    if entropy_penalty > 0:
+        # H(p) = -Σ p*log(p), we want to maximize entropy (minimize negative entropy)
+        gating_log_probs = torch.log(gating_weights + 1e-8)  # [B, E]
+        entropy = -(gating_weights * gating_log_probs).sum(dim=1).mean()  # [B] -> scalar
+        entropy_loss = -entropy_penalty * entropy  # Negative because we want to maximize entropy
+    
+    return ce_loss + entropy_loss
+
+def compute_frequency_weights(labels, class_counts, smoothing=0.5):
+    """
+    Compute frequency-based soft weights: w_i = (freq(y_i))^(-smoothing)
+    """
+    # Get frequencies for each class
+    unique_labels = labels.unique()
+    freq_weights = torch.ones_like(labels, dtype=torch.float)
+    
+    for label in unique_labels:
+        class_freq = class_counts[label.item()]
+        weight = (class_freq + 1) ** (-smoothing)  # +1 for smoothing
+        freq_weights[labels == label] = weight
+    
+    # Normalize so mean weight = 1
+    freq_weights = freq_weights / freq_weights.mean()
+    return freq_weights
 
 def load_data_from_logits(config):
     """Load pre-computed logits for training gating."""
@@ -67,27 +124,6 @@ def load_data_from_logits(config):
     
     return DataLoader(dataset, batch_size=config['gating_params']['batch_size'], 
                      shuffle=True, num_workers=4)
-
-def mixture_cross_entropy_loss(expert_logits, labels, gating_weights):
-    """
-    Cross-entropy loss on mixture of expert predictions.
-    L = -log(Σ_e w_e * softmax(logits_e)[y])
-    """
-    # expert_logits: [B, E, C]
-    # gating_weights: [B, E]  
-    # labels: [B]
-    
-    expert_probs = torch.softmax(expert_logits, dim=-1)  # [B, E, C]
-    mixture_probs = torch.einsum('be,bec->bc', gating_weights, expert_probs)  # [B, C]
-    
-    # Clamp for numerical stability
-    mixture_probs = torch.clamp(mixture_probs, min=1e-7, max=1.0-1e-7)
-    
-    # Cross-entropy: -log(p_y)
-    log_probs = torch.log(mixture_probs)  # [B, C]
-    loss = torch.nn.functional.nll_loss(log_probs, labels)
-    
-    return loss
 
 def train_gating_only():
     """Train only the gating network with fixed α=1, μ=0."""
@@ -122,8 +158,21 @@ def train_gating_only():
         weight_decay=CONFIG['gating_params']['weight_decay']
     )
     
-    # Training loop
+    # Training loop with optional balanced training
     best_loss = float('inf')
+    
+    # Set up class grouping for balanced training
+    if CONFIG['gating_params']['balanced_training']:
+        class_counts = get_cifar100_lt_counts(imb_factor=100)
+        class_to_group = get_class_to_group_by_threshold(class_counts, threshold=CONFIG['grouping']['threshold'])
+        tail_weight = CONFIG['gating_params']['tail_weight']
+        use_freq_weighting = CONFIG['gating_params']['use_freq_weighting']
+        entropy_penalty = CONFIG['gating_params']['entropy_penalty']
+        
+        print(f"✅ Balanced training enabled:")
+        print(f"   - Tail weight: {tail_weight}")
+        print(f"   - Frequency weighting: {use_freq_weighting}")
+        print(f"   - Entropy penalty: {entropy_penalty}")
     
     for epoch in range(CONFIG['gating_params']['epochs']):
         model.train()
@@ -141,8 +190,23 @@ def train_gating_only():
             raw_weights = model.gating_net(gating_features)
             gating_weights = torch.softmax(raw_weights, dim=1)  # [B, E]
             
-            # Mixture cross-entropy loss
-            loss = mixture_cross_entropy_loss(expert_logits, labels, gating_weights)
+            # Compute sample weights for balanced training
+            sample_weights = None
+            if CONFIG['gating_params']['balanced_training']:
+                if use_freq_weighting:
+                    # Use soft frequency-based weighting
+                    sample_weights = compute_frequency_weights(labels.cpu(), class_counts, smoothing=0.5).to(DEVICE)
+                else:
+                    # Use hard group-based weighting
+                    with torch.no_grad():
+                        g = class_to_group[labels.cpu()].to(DEVICE)  # 0=head, 1=tail, move to device
+                        sample_weights = torch.where(g == 0, 
+                                                    torch.tensor(1.0, device=DEVICE),
+                                                    torch.tensor(tail_weight, device=DEVICE))
+            
+            # Mixture cross-entropy loss with sample weights and entropy penalty
+            loss = mixture_cross_entropy_loss(expert_logits, labels, gating_weights, 
+                                            sample_weights, entropy_penalty)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.gating_net.parameters(), max_norm=1.0)

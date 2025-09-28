@@ -35,11 +35,16 @@ CONFIG = {
     'plugin_params': {
         'c': 0.7,  # rejection cost
         'M': 10,   # number of plugin iterations
-        'gamma': 0.3,  # EMA factor for alpha updates
-        'alpha_min': 5e-2,
-        'alpha_max': 2.0,
-        'lambda_grid': [-1.0, -0.75, -0.5, -0.35, -0.25, -0.15, 0.0, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0],  # lambda values to sweep
-        'cov_target': 0.6,  # target coverage for fitting c
+        'gamma': 0.25,  # EMA factor for alpha updates (reduced for stability)
+        'alpha_min': 0.8,   # tighter bounds for stability
+        'alpha_max': 1.25,  # tighter bounds for stability
+        'lambda_grid': np.linspace(-1.5, -0.25, 11).tolist(),  # focused on useful range
+        'cov_target': 0.62,  # reduced from 0.75 for better ranking
+        'objective': 'balanced',  # 'worst', 'balanced', or 'hybrid'
+        'hybrid_beta': 0.2,  # weight for balanced term in hybrid objective
+        'alpha_steps': 4,  # reduced from 7 for efficiency
+        'use_conditional_alpha': True,  # use conditional acceptance for alpha updates
+        'tie_break_balanced': True,  # use balanced AURC for tie-breaking when optimizing worst
     },
     'output': {
         'checkpoints_dir': './checkpoints/argse_balanced_plugin/',
@@ -83,6 +88,12 @@ def cache_eta_mix(gse_model, loader, class_to_group):
     return torch.cat(etas), torch.cat(labels)
 
 def compute_raw_margin(eta, alpha, mu, class_to_group):
+    # Ensure all tensors are on same device
+    device = eta.device
+    alpha = alpha.to(device)
+    mu = mu.to(device)
+    class_to_group = class_to_group.to(device)
+    
     # score = max_y α_{g(y)} * η̃_y
     score = (alpha[class_to_group] * eta).max(dim=1).values  # [N]
     # threshold = Σ_y (1/α_{g(y)} - μ_{g(y)}) * η̃_y
@@ -141,22 +152,67 @@ def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
     
     return float(np.mean(group_errors)), group_errors
 
-def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
-                           gamma=0.3, alpha_min=5e-2, alpha_max=2.0):
+def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
     """
-    Fixed-point alpha update based on acceptance frequency matching.
-    α_k ← Π_geomean=1,[α_min,α_max]((1-γ)α_k + γ·K·Ê_S1[1{accept}·1{y∈G_k}])
+    Compute worst-group error rate on a split S.
+    
+    Returns:
+        worst_error: worst-group error (max of per-group errors)
+        group_errors: list of per-group error rates
+    """
+    accepted, preds, _ = accepted_and_pred(eta, alpha, mu, c, class_to_group)
+    
+    if accepted.sum() == 0:
+        # No samples accepted -> return worst possible error
+        return 1.0, [1.0] * K
+    
+    y_groups = class_to_group[y]  # [N]
+    group_errors = []
+    
+    for k in range(K):
+        mask_k = (y_groups == k) & accepted
+        if mask_k.sum() == 0:
+            # No accepted samples in group k
+            group_errors.append(1.0)
+        else:
+            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+            group_errors.append(1.0 - group_acc)
+    
+    return float(max(group_errors)), group_errors
+
+def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
+    """
+    Compute hybrid error: worst_error + beta * balanced_error
+    
+    Returns:
+        hybrid_error: worst + beta * balanced
+        (worst_error, balanced_error): individual components
+    """
+    worst_err, group_errs = worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K)
+    bal_err = float(np.mean(group_errs))
+    
+    hybrid_err = worst_err + beta * bal_err
+    return hybrid_err, (worst_err, bal_err)
+
+def update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
+                                        gamma=0.3, alpha_min=0.8, alpha_max=1.25):
+    """
+    Fixed-point alpha update using conditional acceptance rates per group.
+    α_k ← (1-γ)α_k + γ·r̂_k where r̂_k = #{acc ∧ y∈G_k} / #{y∈G_k}
     """
     accepted, _, _ = accepted_and_pred(eta_S1, alpha, mu, c, class_to_group)
     y_groups = class_to_group[y_S1]  # [N]
-    N = y_S1.numel()
     
-    # Joint acceptance per group: (1/N) * sum 1{accept}1{y∈G_k}
-    joint = torch.zeros(K, dtype=torch.float32, device=eta_S1.device)
+    # Conditional acceptance per group: r̂_k = acceptance rate within group k
+    alpha_hat = torch.zeros(K, dtype=torch.float32, device=eta_S1.device)
     for k in range(K):
-        joint[k] = (accepted & (y_groups == k)).sum().float() / float(N)
-    
-    alpha_hat = K * joint  # target α_k
+        group_mask = (y_groups == k)
+        if group_mask.sum() > 0:  # Group has samples
+            group_acceptance_rate = (accepted & group_mask).sum().float() / group_mask.sum().float()
+            # Smooth with small constant to avoid zeros
+            alpha_hat[k] = group_acceptance_rate + 1e-3
+        else:
+            alpha_hat[k] = 1.0  # Default value for empty groups
     
     # EMA update
     new_alpha = (1 - gamma) * alpha + gamma * alpha_hat
@@ -168,6 +224,38 @@ def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K,
     new_alpha = new_alpha.clamp(min=alpha_min, max=alpha_max)
     
     return new_alpha
+
+def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
+                           gamma=0.3, alpha_min=0.8, alpha_max=1.25, use_conditional=True):
+    """
+    Fixed-point alpha update with option for conditional or joint acceptance.
+    """
+    if use_conditional:
+        return update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
+                                                  gamma, alpha_min, alpha_max)
+    else:
+        # Original joint acceptance method
+        accepted, _, _ = accepted_and_pred(eta_S1, alpha, mu, c, class_to_group)
+        y_groups = class_to_group[y_S1]  # [N]
+        N = y_S1.numel()
+        
+        # Joint acceptance per group: (1/N) * sum 1{accept}1{y∈G_k}
+        joint = torch.zeros(K, dtype=torch.float32, device=eta_S1.device)
+        for k in range(K):
+            joint[k] = (accepted & (y_groups == k)).sum().float() / float(N)
+        
+        alpha_hat = K * joint  # target α_k
+        
+        # EMA update
+        new_alpha = (1 - gamma) * alpha + gamma * alpha_hat
+        
+        # Project: geomean=1, then clamp
+        new_alpha = new_alpha.clamp_min(alpha_min)
+        log_alpha = new_alpha.log()
+        new_alpha = torch.exp(log_alpha - log_alpha.mean())
+        new_alpha = new_alpha.clamp(min=alpha_min, max=alpha_max)
+        
+        return new_alpha
 
 def mu_from_lambda_grid(lambdas, K):
     """
@@ -185,25 +273,33 @@ def mu_from_lambda_grid(lambdas, K):
 
 def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                     c, M=10, lambda_grid=(-0.5, -0.25, 0.0, 0.25, 0.5),
-                    alpha_init=None, gamma=0.3, cov_target=0.6):
+                    alpha_init=None, gamma=0.3, cov_target=0.6, 
+                    objective='balanced', hybrid_beta=0.2, alpha_steps=4,
+                    use_conditional_alpha=True, tie_break_balanced=True):
     """
-    Main GSE-Balanced plugin algorithm.
+    Main GSE-Balanced plugin algorithm with improved optimization strategies.
     
     Args:
         eta_S1, y_S1: cached posteriors and labels for S1 (tuning split)
         eta_S2, y_S2: cached posteriors and labels for S2 (validation split)
         class_to_group: [C] class to group mapping
         K: number of groups
-        c: rejection cost
+        c: rejection cost (unused, kept for compatibility)
         M: number of plugin iterations
         lambda_grid: values of λ to sweep over
         alpha_init: initial alpha values
         gamma: EMA factor for alpha updates
+        cov_target: target coverage for threshold fitting
+        objective: 'worst', 'balanced', or 'hybrid'
+        hybrid_beta: weight for balanced term if objective='hybrid'
+        alpha_steps: number of fixed-point steps for alpha updates
+        use_conditional_alpha: use conditional acceptance for alpha updates
+        tie_break_balanced: use balanced AURC for tie-breaking in worst optimization
         
     Returns:
         best_alpha: optimal α* 
         best_mu: optimal μ*
-        best_score: best balanced error on S2
+        best_score: best error on S2 (according to objective)
     """
     device = eta_S1.device
     y_S1 = y_S1.to(device)
@@ -219,48 +315,81 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     best_alpha = alpha.clone()
     best_mu = torch.zeros(K, dtype=torch.float32, device=device)
     best_score = float('inf')
+    best_balanced_score = float('inf')  # For tie-breaking
     
     mu_candidates = [mu.to(device) for mu in mu_from_lambda_grid(lambda_grid, K)]
     
     print(f"Starting GSE-Balanced plugin with {M} iterations, {len(mu_candidates)} μ candidates")
+    print(f"Objective: {objective}, Coverage target: {cov_target:.2f}")
+    print(f"Alpha method: {'conditional' if use_conditional_alpha else 'joint'}")
+    if objective == 'hybrid':
+        print(f"Hybrid beta: {hybrid_beta}")
     
-    best_c = None
+    best_t = None
     for m in range(M):
         print(f"\n--- Plugin Iteration {m+1}/{M} ---")
         for i, mu in enumerate(mu_candidates):
             alpha_cur = alpha.clone()
-            c_cur = None
+            t_cur = None
 
-            # vài bước fixed-point cho α; mỗi bước re-fit c bằng raw margin S1
-            for step in range(3):
+            # Multiple fixed-point steps for α; refit threshold each step
+            for step in range(alpha_steps):
                 raw_S1 = compute_raw_margin(eta_S1, alpha_cur, mu, class_to_group)
-                c_cur = c_for_target_coverage_from_raw(raw_S1, cov_target)  # fit c trên S1
-                # update α bằng accept mask tại c_cur
+                t_cur = c_for_target_coverage_from_raw(raw_S1, cov_target)  # fit threshold on S1
+                # update α using accept mask at t_cur
                 alpha_cur = update_alpha_fixed_point(
-                    eta_S1, y_S1, alpha_cur, mu, c_cur, class_to_group, K,
-                    gamma=gamma
+                    eta_S1, y_S1, alpha_cur, mu, t_cur, class_to_group, K,
+                    gamma=gamma, use_conditional=use_conditional_alpha
                 )
 
-            # Đánh giá trên S2 với cùng c_cur
-            bal_err, group_errs = balanced_error_on_S(
-                eta_S2, y_S2, alpha_cur, mu, c_cur, class_to_group, K
-            )
+            # Evaluate on S2 with same t_cur according to objective
+            if objective == 'worst':
+                error_score, group_errs = worst_error_on_S(
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                )
+                error_type = "worst"
+                # Also compute balanced for tie-breaking
+                balanced_score = float(np.mean(group_errs))
+            elif objective == 'balanced':
+                error_score, group_errs = balanced_error_on_S(
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                )
+                error_type = "bal"
+                balanced_score = error_score
+            elif objective == 'hybrid':
+                error_score, (worst_err, bal_err) = hybrid_error_on_S(
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, hybrid_beta
+                )
+                error_type = f"hybrid(w={worst_err:.3f},b={bal_err:.3f})"
+                balanced_score = bal_err
+            else:
+                raise ValueError(f"Unknown objective: {objective}")
 
-            if bal_err < best_score:
-                best_score = bal_err
+            # Selection logic with tie-breaking
+            is_better = False
+            if error_score < best_score - 1e-6:  # Significant improvement
+                is_better = True
+            elif abs(error_score - best_score) < 1e-6 and tie_break_balanced:  # Tie-break
+                if balanced_score < best_balanced_score - 1e-6:
+                    is_better = True
+            
+            if is_better:
+                best_score = error_score
+                best_balanced_score = balanced_score
                 best_alpha = alpha_cur.clone()
                 best_mu = mu.clone()
-                best_c = c_cur
-                print(f"  λ={lambda_grid[i]:.2f}: NEW BEST! bal_err={bal_err:.4f}, "
+                best_t = t_cur
+                tie_info = f" (tie-break: bal={balanced_score:.4f})" if abs(error_score - best_score) < 1e-6 else ""
+                print(f"  λ={lambda_grid[i]:.2f}: NEW BEST! {error_type}={error_score:.4f}, "
                     f"α=[{alpha_cur[0]:.3f},{alpha_cur[1]:.3f}], "
-                    f"μ=[{mu[0]:.3f},{mu[1]:.3f}], c={c_cur:.3f}")
+                    f"μ=[{mu[0]:.3f},{mu[1]:.3f}], t={t_cur:.3f}{tie_info}")
             else:
-                print(f"  λ={lambda_grid[i]:.2f}: bal_err={bal_err:.4f} (c={c_cur:.3f})")
+                print(f"  λ={lambda_grid[i]:.2f}: {error_type}={error_score:.4f} (t={t_cur:.3f})")
 
         alpha = (0.5 * alpha + 0.5 * best_alpha).clone()
-        print(f"[Iter {m+1}] Current best: bal_err={best_score:.4f}, c*={best_c:.3f}")
+        print(f"[Iter {m+1}] Current best: {objective}={best_score:.4f}, t*={best_t:.3f}")
 
-    return best_alpha.cpu(), best_mu.cpu(), best_score, float(best_c)
+    return best_alpha.cpu(), best_mu.cpu(), best_score, float(best_t)
 
 def calculate_optimal_c_from_eta(eta, target_coverage=0.6):
     """
@@ -381,9 +510,10 @@ def main():
     # Use current c or switch to optimal
     c_to_use = optimal_c # or optimal_c
     
-    # 6) Run GSE-Balanced plugin
+    # 6) Run GSE-Balanced plugin with improved parameters
     cov_target = CONFIG['plugin_params']['cov_target']
-    print(f"\n=== Running GSE-Balanced Plugin (target_coverage={cov_target:.2f}) ===")
+    objective = CONFIG['plugin_params']['objective']
+    print(f"\n=== Running GSE-Balanced Plugin (target_coverage={cov_target:.2f}, objective={objective}) ===")
     alpha_star, mu_star, best_score, t_star = gse_balanced_plugin(
         eta_S1=eta_S1.to(DEVICE),
         y_S1=y_S1.to(DEVICE),
@@ -396,6 +526,11 @@ def main():
         lambda_grid=CONFIG['plugin_params']['lambda_grid'],
         gamma=CONFIG['plugin_params']['gamma'],
         cov_target=CONFIG['plugin_params']['cov_target'],
+        objective=CONFIG['plugin_params']['objective'],
+        hybrid_beta=CONFIG['plugin_params']['hybrid_beta'],
+        alpha_steps=CONFIG['plugin_params']['alpha_steps'],
+        use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
+        tie_break_balanced=CONFIG['plugin_params']['tie_break_balanced'],
     )
     print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")
 
@@ -404,7 +539,8 @@ def main():
     print("\n🎉 GSE-Balanced Plugin Complete!")
     print(f"α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
-    print(f"Best balanced error on S2 = {best_score:.4f}")
+    print(f"Best {objective} error on S2 = {best_score:.4f}")
+    print(f"Raw-margin threshold t* = {t_star:.3f}")
     
     # Save checkpoint with optimal parameters
     output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
