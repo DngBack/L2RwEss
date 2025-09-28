@@ -11,6 +11,7 @@ import numpy as np
 import json
 from pathlib import Path
 from tqdm import tqdm
+import torch.nn.functional as F
 
 from src.models.argse import AR_GSE
 from src.data.groups import get_class_to_group_by_threshold
@@ -42,6 +43,37 @@ CONFIG = {
         'entropy_penalty': 0.0000,  # Giảm entropy_penalty về 0 để tránh ép uniform
         'diversity_penalty': 0.002,  # usage_balance nhỏ để tránh collapse
         'gradient_clip': 0.5,  # NEW: Gradient clipping for stability
+    },
+    'selective': {
+        # Core selective parameters
+        'tau': 0.70,              # global target coverage backup
+        'tau_by_group': [0.55, 0.45],  # per-group τ_k (K=2 expected)
+        'beta_tail': 2.0,         # tail weighting in L_sel (head=1, tail=β_tail)
+        'kappa': 20.0,            # sharpness κ for sigmoid smoothing (can raise to 25 later)
+        'lambda_cov': 15.0,       # λ_cov global
+        'lambda_cov_g': 20.0,     # λ_cov-g group coverage penalty
+        'lambda_H': 0.01,         # λ_H entropy regularizer
+        'lambda_GA': 0.05,        # λ_GA group-aware prior KL
+        # Scheduling
+        'stageA_epochs': 5,       # Stage A (warm-up) epochs (mixture CE)
+        'cycles': 6,              # M cycles (Stage B alternating)
+        'epochs_per_cycle': 3,    # B1 epochs per cycle
+        'alpha_steps': 2,         # B2 fixed-point steps for α per cycle
+        'update_alpha': True,     # Whether to run α updates (disable if relying on cov-g)
+        'use_quantile_t': True,   # Update t by quantile each epoch (else learnable not yet supported)
+        'alpha_min': 0.85,
+        'alpha_max': 1.15,
+        'gamma_alpha': 0.20,      # EMA factor for α
+        # μ / λ grid search (B3)
+    'lambda_grid': [round(x,2) for x in np.linspace(-2.0,2.0,41)],
+        'opt_objective': 'worst',  # 'worst' or 'balanced'
+        # Priors & temperatures
+        'prior_tail_boost': 1.5,
+        'prior_head_boost': 1.5,
+        'temperature': {},        # dict name->T (fallback 1.0)
+        # Logging
+        'log_interval': 50,
+        'eps': 1e-8,
     },
     'output': {
         'checkpoints_dir': './checkpoints/gating_pretrained/',
@@ -143,6 +175,397 @@ def load_data_from_logits(config):
     return DataLoader(dataset, batch_size=config['gating_params']['batch_size'], 
                      shuffle=True, num_workers=4)
 
+# ---------------------------- Selective Mode Utilities ---------------------------- #
+
+def load_two_splits_from_logits(config):
+    """Load tuneV (S1) and val_lt (S2) splits with stacked expert logits."""
+    logits_root = Path(config['experts']['logits_dir']) / config['dataset']['name']
+    splits_dir = Path(config['dataset']['splits_dir'])
+    expert_names = config['experts']['names']
+    num_experts = len(expert_names)
+    num_classes = config['dataset']['num_classes']
+
+    # Base datasets
+    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+
+    split_specs = [
+        ('tuneV', cifar_train_full, 'tuneV_indices.json'),
+        ('val_lt', cifar_test_full, 'val_lt_indices.json')
+    ]
+    out = {}
+    for split_name, base_ds, fname in split_specs:
+        idx_path = splits_dir / fname
+        if not idx_path.exists():
+            raise FileNotFoundError(f"Missing indices file: {idx_path}")
+        indices = json.loads(idx_path.read_text())
+        stacked = torch.zeros(len(indices), num_experts, num_classes)
+        for i, ename in enumerate(expert_names):
+            logit_path = logits_root / ename / f"{split_name}_logits.pt"
+            if not logit_path.exists():
+                raise FileNotFoundError(f"Missing logits file: {logit_path}")
+            stacked[:, i, :] = torch.load(logit_path, map_location='cpu')
+        labels = torch.tensor(np.array(base_ds.targets)[indices])
+        dataset = TensorDataset(stacked, labels)
+        out[split_name] = DataLoader(dataset, batch_size=CONFIG['gating_params']['batch_size'], shuffle=True if split_name=='tuneV' else False, num_workers=4)
+    return out['tuneV'], out['val_lt']
+
+def build_group_priors(expert_names, K, head_boost=1.5, tail_boost=1.5):
+    """Construct simple group-aware priors π_g over experts.
+    K groups (assume 2 if not otherwise). For head group boost head-friendly methods (ce / irm),
+    for tail group boost tail-friendly methods (balsoftmax/logitadjust/ride/ldam/disalign).
+    Returns tensor [K, E]."""
+    E = len(expert_names)
+    pi = torch.ones(K, E, dtype=torch.float32)
+    head_keywords = ['ce', 'irm']
+    tail_keywords = ['balsoft', 'logitadjust', 'ride', 'ldam', 'disalign']
+    for e, name in enumerate(expert_names):
+        lname = name.lower()
+        if any(k in lname for k in head_keywords):
+            pi[0, e] *= head_boost
+        if K > 1 and any(k in lname for k in tail_keywords):
+            pi[1, e] *= tail_boost
+    # Normalize each group
+    pi = pi / pi.sum(dim=1, keepdim=True)
+    return pi
+
+def temperature_scale_logits(expert_logits, expert_names, temp_cfg):
+    """Apply per-expert temperature scaling if provided (dict name->T)."""
+    if not temp_cfg:
+        return expert_logits
+    scaled = expert_logits.clone()
+    for i, name in enumerate(expert_names):
+        T = float(temp_cfg.get(name, 1.0))
+        if abs(T - 1.0) > 1e-6:
+            scaled[:, i, :] = scaled[:, i, :] / T
+    return scaled
+
+def compute_mixture_and_w(model, expert_logits):
+    """Return gating weights w [B,E] and mixture posterior η [B,C]."""
+    with torch.no_grad():
+        pass
+    gating_features = model.feature_builder(expert_logits)
+    w = torch.softmax(model.gating_net(gating_features), dim=1)  # [B,E]
+    expert_probs = torch.softmax(expert_logits, dim=-1)          # [B,E,C]
+    eta = torch.einsum('be,bec->bc', w, expert_probs)            # [B,C]
+    return w, eta, expert_probs
+
+def compute_raw_margin(eta, alpha, mu, class_to_group):
+    """m_raw(x) = max_y α_{g(y)} η_y - Σ_y (1/α_{g(y)} - μ_{g(y)}) η_y"""
+    device = eta.device
+    alpha = alpha.to(device)
+    mu = mu.to(device)
+    class_to_group = class_to_group.to(device)
+    alpha_per_class = alpha[class_to_group]         # [C]
+    score = (alpha_per_class * eta).max(dim=1).values
+    coeff = 1.0 / alpha_per_class - mu[class_to_group]
+    threshold_term = (coeff.unsqueeze(0) * eta).sum(dim=1)
+    return score - threshold_term  # [B]
+
+def update_alpha_fixed_point_conditional(eta, y, alpha, mu, t, class_to_group, K, gamma=0.2, alpha_min=0.85, alpha_max=1.15, rho=0.03):
+    """Conditional acceptance fixed-point for α (reuse simplified logic)."""
+    device = eta.device
+    with torch.no_grad():
+        raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+        accepted = raw > t
+        y_groups = class_to_group[y].to(device)
+        alpha_hat = torch.ones_like(alpha)
+        for k in range(K):
+            mask = (y_groups == k)
+            if mask.any():
+                grp_acc = (accepted & mask).float().sum() / mask.float().sum()
+                alpha_hat[k] = grp_acc + 1e-3
+        # EMA
+        new_alpha = (1 - gamma) * alpha + gamma * alpha_hat
+        # Project: enforce geomean=1 then clamp
+        new_alpha = new_alpha.clamp_min(alpha_min)
+        loga = new_alpha.log()
+        new_alpha = torch.exp(loga - loga.mean())
+        new_alpha = new_alpha.clamp(min=alpha_min, max=alpha_max)
+    # Add directional prior u=[-1,+1] for K=2 to gently push tail up
+    if K == 2 and rho > 0:
+        u = torch.tensor([-1.0, 1.0], device=new_alpha.device)
+        new_alpha = new_alpha + rho * u
+        # Re-project
+        new_alpha = new_alpha.clamp_min(alpha_min)
+        loga2 = new_alpha.log()
+        new_alpha = torch.exp(loga2 - loga2.mean()).clamp(min=alpha_min, max=alpha_max)
+    return new_alpha
+
+def project_alpha(a, alpha_min=0.85, alpha_max=1.15):
+    a = a.clamp_min(alpha_min)
+    loga = a.log()
+    a = torch.exp(loga - loga.mean())
+    return a.clamp(min=alpha_min, max=alpha_max)
+
+def mu_from_lambda_grid(lambdas, K):
+    mus = []
+    for lam in lambdas:
+        if K == 2:
+            mus.append(torch.tensor([lam/2.0, -lam/2.0], dtype=torch.float32))
+        else:
+            raise NotImplementedError("Provide μ grid for K>2")
+    return mus
+
+def evaluate_split(eta, y, alpha, mu, t, class_to_group, K, objective='worst'):
+    """Compute error on accepted samples under objective."""
+    with torch.no_grad():
+        raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+        accepted = raw > t
+        if not accepted.any():
+            return 1.0, [1.0]*K
+        alpha_per_class = alpha[class_to_group]
+        preds = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)
+        groups = class_to_group[y]
+        errs = []
+        for k in range(K):
+            m = (groups == k) & accepted
+            if m.any():
+                acc = (preds[m] == y[m]).float().mean().item()
+                errs.append(1-acc)
+            else:
+                errs.append(1.0)
+        if objective == 'balanced':
+            return float(np.mean(errs)), errs
+        else:
+            return float(max(errs)), errs
+
+def selective_losses(expert_logits, labels, model, alpha, mu, t, cfg_sel, class_to_group, pi_by_group):
+    """Compute all selective-training losses and diagnostics for one batch."""
+    eps = cfg_sel['eps']
+    # Forward gating & mixture
+    gating_features = model.feature_builder(expert_logits)
+    raw_w = model.gating_net(gating_features)
+    w = torch.softmax(raw_w, dim=1)  # [B,E]
+    expert_probs = torch.softmax(expert_logits, dim=-1)  # [B,E,C]
+    eta = torch.einsum('be,bec->bc', w, expert_probs)    # [B,C]
+
+    # p^α: q = α_{g(y)} * η_y then normalize
+    alpha_per_class = alpha[class_to_group].to(eta.device)  # [C]
+    q = eta * alpha_per_class.unsqueeze(0)  # [B,C]
+    q = q / (q.sum(dim=1, keepdim=True) + eps)
+
+    ce = F.nll_loss(torch.log(q + eps), labels, reduction='none')  # [B]
+
+    # Raw margin
+    m_raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+    s = torch.sigmoid(cfg_sel['kappa'] * (m_raw - t))  # [B]
+
+    # Tail-aware weighting in L_sel
+    y_groups = class_to_group[labels]
+    if len(cfg_sel.get('tau_by_group', [])) == 2 and cfg_sel.get('beta_tail', 1.0) != 1.0:
+        beta_tail = cfg_sel['beta_tail']
+        sample_w = torch.where(y_groups == 1, torch.tensor(beta_tail, device=eta.device), torch.tensor(1.0, device=eta.device))
+        L_sel = (s * ce * sample_w).sum() / (s * sample_w).sum().clamp_min(eps)
+    else:
+        L_sel = (s * ce).sum() / (s.sum() + eps)
+    cov_mean = s.mean()
+    L_cov = cfg_sel['lambda_cov'] * (cov_mean - cfg_sel['tau'])**2
+
+    # Group coverage (E[s 1{y∈Gk}] - tau/K)^2
+    L_cov_g = torch.zeros(1, device=expert_logits.device)
+    if cfg_sel['lambda_cov_g'] > 0:
+        K = pi_by_group.size(0)
+        tau_by_group = cfg_sel.get('tau_by_group', [])
+        if len(tau_by_group) != K:
+            tau_by_group = [cfg_sel['tau']/K] * K
+        cov_terms = []
+        for k in range(K):
+            mask = (y_groups == k)
+            s_mask_mean = (s[mask].mean() if mask.any() else torch.zeros((), device=s.device))
+            cov_k = (s_mask_mean - tau_by_group[k])**2
+            cov_terms.append(cov_k)
+        L_cov_g = cfg_sel['lambda_cov_g'] * torch.stack(cov_terms).sum()
+
+    # Entropy regularizer λ_H * E[-Σ w log w]
+    H_w = -(w * torch.log(w + eps)).sum(dim=1).mean()
+    L_H = cfg_sel['lambda_H'] * H_w
+
+    # Group-aware prior KL λ_GA * E[ KL(w || π_{g(y)}) ]
+    y_groups = class_to_group[labels]
+    pi = pi_by_group[y_groups]  # [B,E]
+    KL = (w * (torch.log(w + eps) - torch.log(pi + eps))).sum(dim=1).mean()
+    L_GA = cfg_sel['lambda_GA'] * KL
+
+    total = L_sel + L_cov + L_cov_g + L_H + L_GA
+    diagnostics = {
+        'L_sel': L_sel.item(), 'L_cov': L_cov.item(), 'L_cov_g': L_cov_g.item(),
+        'L_H': L_H.item(), 'L_GA': L_GA.item(), 'coverage': cov_mean.item(),
+        'mean_s_head': (s[y_groups==0].mean().item() if (y_groups==0).any() else 0.0),
+        'mean_s_tail': (s[y_groups==1].mean().item() if (y_groups==1).any() else 0.0),
+        'entropy_w': H_w.item(), 'kl_w': KL.item(),
+    }
+    return total, diagnostics, m_raw.detach(), s.detach()
+
+def run_selective_mode():
+    """End-to-end selective gating training (Stage A + alternating Stage B)."""
+    torch.manual_seed(CONFIG['seed'])
+    np.random.seed(CONFIG['seed'])
+
+    print("=== Selective Gating Training (AR-GSE) ===")
+    sel_cfg = CONFIG['selective']
+
+    # Load splits
+    S1_loader, S2_loader = load_two_splits_from_logits(CONFIG)
+    print(f"Loaded S1 (tuneV) batches: {len(S1_loader)} | S2 (val_lt) batches: {len(S2_loader)}")
+
+    # Grouping
+    class_counts_full = get_cifar100_lt_counts(imb_factor=100)
+    class_to_group = get_class_to_group_by_threshold(class_counts_full, threshold=CONFIG['grouping']['threshold'])
+    K = (class_to_group.max().item() + 1)
+    print(f"Groups: K={K} (head={(class_to_group==0).sum().item()} tail={(class_to_group==1).sum().item() if K>1 else 0})")
+
+    # Build model (dynamic feature dim)
+    num_experts = len(CONFIG['experts']['names'])
+    with torch.no_grad():
+        dummy = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
+        tmp = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], K, 1).to(DEVICE)
+        feat_dim = tmp.feature_builder(dummy).size(-1)
+        del tmp
+    # Recreate model with correct enriched feature dimension (builder now outputs 7E+3)
+    model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], K, feat_dim).to(DEVICE)
+
+    # Init α, μ
+    alpha = torch.ones(K, device=DEVICE)
+    mu = torch.zeros(K, device=DEVICE)
+
+    # Optimizer (gating params only)
+    optimizer = optim.Adam(model.gating_net.parameters(), lr=CONFIG['gating_params']['lr'], weight_decay=CONFIG['gating_params']['weight_decay'])
+
+    # Priors π_g
+    pi_by_group = build_group_priors(CONFIG['experts']['names'], K, sel_cfg['prior_head_boost'], sel_cfg['prior_tail_boost']).to(DEVICE)
+    print(f"Group priors π_g shape: {pi_by_group.shape}")
+
+    # Stage A: warm-up mixture CE
+    print(f"\n-- Stage A: Warm-up ({sel_cfg['stageA_epochs']} epochs) --")
+    t = torch.tensor(0.0, device=DEVICE)
+    for epoch in range(sel_cfg['stageA_epochs']):
+        model.train()
+        running = 0.0
+        n_batches = 0
+        raw_margins_epoch = []
+        for b,(expert_logits, labels) in enumerate(S1_loader):
+            expert_logits = expert_logits.to(DEVICE)
+            labels = labels.to(DEVICE)
+            # Temperature scaling (in-place transform)
+            expert_logits = temperature_scale_logits(expert_logits, CONFIG['experts']['names'], sel_cfg['temperature'])
+            optimizer.zero_grad()
+            w, eta, expert_probs = compute_mixture_and_w(model, expert_logits)
+            # Standard mixture CE
+            mixture_probs = eta.clamp(min=1e-8)
+            ce = F.nll_loss(mixture_probs.log(), labels)
+            ce.backward()
+            optimizer.step()
+            running += ce.item()
+            n_batches += 1
+            # Collect raw margins for threshold init
+            with torch.no_grad():
+                rm = compute_raw_margin(eta.detach(), alpha, mu, class_to_group.to(DEVICE))
+                raw_margins_epoch.append(rm.cpu())
+        avg = running / max(1, n_batches)
+        raw_cat = torch.cat(raw_margins_epoch)
+        if sel_cfg['use_quantile_t']:
+            t = torch.quantile(raw_cat.to(DEVICE), 1 - sel_cfg['tau'])
+        print(f"StageA Epoch {epoch+1}: loss={avg:.4f} | t={t.item():.4f}")
+
+    # Stage B: alternating cycles
+    print(f"\n-- Stage B: Alternating (cycles={sel_cfg['cycles']}, epochs_per_cycle={sel_cfg['epochs_per_cycle']}) --")
+    lambda_grid = sel_cfg['lambda_grid']
+    mu_candidates = [m.to(DEVICE) for m in mu_from_lambda_grid(lambda_grid, K)]
+    best_mu = mu.clone()
+    best_score = float('inf')
+
+    for cycle in range(sel_cfg['cycles']):
+        print(f"\nCycle {cycle+1}/{sel_cfg['cycles']}")
+        # B1: optimize gating with selective-aware loss
+        for ep in range(sel_cfg['epochs_per_cycle']):
+            model.train()
+            epoch_diag = []
+            raw_collect = []
+            for batch_idx,(expert_logits, labels) in enumerate(S1_loader):
+                expert_logits = temperature_scale_logits(expert_logits.to(DEVICE), CONFIG['experts']['names'], sel_cfg['temperature'])
+                labels = labels.to(DEVICE)
+                optimizer.zero_grad()
+                loss, diag, m_raw, s = selective_losses(expert_logits, labels, model, alpha, mu, t, sel_cfg, class_to_group.to(DEVICE), pi_by_group)
+                loss.backward()
+                if CONFIG['gating_params'].get('gradient_clip', 0) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.gating_net.parameters(), CONFIG['gating_params']['gradient_clip'])
+                optimizer.step()
+                epoch_diag.append(diag)
+                raw_collect.append(m_raw.cpu())
+                if (batch_idx+1) % sel_cfg['log_interval'] == 0:
+                    print(f"  [B1 e{ep+1} b{batch_idx+1}] L_sel={diag['L_sel']:.3f} cov={diag['coverage']:.3f} H={diag['entropy_w']:.3f}")
+            # Update threshold t via quantile each epoch
+            if sel_cfg['use_quantile_t']:
+                all_raw = torch.cat(raw_collect).to(DEVICE)
+                t = torch.quantile(all_raw, 1 - sel_cfg['tau'])
+            # Summarize epoch diagnostics
+            keys = epoch_diag[0].keys()
+            avg_diag = {k: float(np.mean([d[k] for d in epoch_diag])) for k in keys}
+            print(f"  B1 Epoch {ep+1}: t={t.item():.4f} | " + ", ".join([f"{k}={avg_diag[k]:.3f}" for k in ['L_sel','coverage','mean_s_head','mean_s_tail']]))
+
+        # Cache η for S1/S2 for α & μ updates
+        def cache_eta(loader):
+            model.eval()
+            etas = []
+            ys = []
+            with torch.no_grad():
+                for expert_logits, labels in loader:
+                    expert_logits = temperature_scale_logits(expert_logits.to(DEVICE), CONFIG['experts']['names'], sel_cfg['temperature'])
+                    w, eta_batch, _ = compute_mixture_and_w(model, expert_logits)
+                    etas.append(eta_batch.cpu())
+                    ys.append(labels.clone())
+            return torch.cat(etas).to(DEVICE), torch.cat(ys).to(DEVICE)
+        eta_S1, y_S1 = cache_eta(S1_loader)
+        eta_S2, y_S2 = cache_eta(S2_loader)
+
+        # B2: update α (optional)
+        if sel_cfg['update_alpha']:
+            for _ in range(sel_cfg['alpha_steps']):
+                alpha = update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, t, class_to_group.to(DEVICE), K,
+                                                             gamma=sel_cfg['gamma_alpha'], alpha_min=sel_cfg['alpha_min'], alpha_max=sel_cfg['alpha_max'], rho=0.03)
+            print(f"  Updated α: {alpha.tolist()}")
+
+        # B3: sweep μ via λ grid on S2
+        mu_best_local = mu.clone()
+        score_best_local = float('inf')
+        for j, mu_cand in enumerate(mu_candidates):
+            # Fit t for these params using S1 raw margins (could refine, keep global t for speed)
+            raw_S1 = compute_raw_margin(eta_S1, alpha, mu_cand, class_to_group.to(DEVICE))
+            t_cand = torch.quantile(raw_S1, 1 - sel_cfg['tau']) if sel_cfg['use_quantile_t'] else t
+            score, group_errs = evaluate_split(eta_S2, y_S2, alpha, mu_cand, t_cand, class_to_group.to(DEVICE), K, objective=sel_cfg['opt_objective'])
+            print(f"  λ[{lambda_grid[j]:.2f}] -> {sel_cfg['opt_objective']} err={score:.4f} t={t_cand:.4f} | groups={['{:.3f}'.format(e) for e in group_errs]}")
+            if score < score_best_local - 1e-6:
+                score_best_local = score
+                mu_best_local = mu_cand.clone()
+        # EMA stabilize μ after sweeping candidates
+        mu = 0.5 * mu + 0.5 * mu_best_local
+        print(f"  Selected μ={mu.tolist()} (score={score_best_local:.4f})")
+        if score_best_local < best_score - 1e-6:
+            best_score = score_best_local
+            best_mu = mu.clone()
+
+        # EMA stabilize α
+        alpha = 0.5 * alpha + 0.5 * project_alpha(alpha, sel_cfg['alpha_min'], sel_cfg['alpha_max'])
+        print(f"  End Cycle {cycle+1}: best_score_so_far={best_score:.4f}")
+
+    # Save checkpoint
+    output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = {
+        'gating_net_state_dict': model.gating_net.state_dict(),
+        'alpha': alpha.cpu(),
+        'mu': best_mu.cpu(),
+        't': t.item(),
+        'pi_by_group': pi_by_group.cpu(),
+        'config': CONFIG,
+        'mode': 'selective'
+    }
+    torch.save(ckpt, output_dir / 'gating_selective.ckpt')
+    print(f"\n✅ Selective training complete. Saved checkpoint to {output_dir / 'gating_selective.ckpt'}")
+    print(f"Final α={alpha.tolist()} | μ={best_mu.tolist()} | t={t.item():.4f} | best_score={best_score:.4f}")
+
+
 def train_gating_only():
     """Train only the gating network with fixed α=1, μ=0."""
     torch.manual_seed(CONFIG['seed'])
@@ -173,7 +596,6 @@ def train_gating_only():
     # Compute gating feature dimension dynamically
     with torch.no_grad():
         dummy = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
-        # Create temporary model to get feature dimension
         temp_model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
         gating_feature_dim = temp_model.feature_builder(dummy).size(-1)
         del temp_model
@@ -282,5 +704,18 @@ def train_gating_only():
     
     print(f"✅ Gating training complete. Best loss: {best_loss:.4f}")
 
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser(description='Train gating network (pretrain or selective)')
+    p.add_argument('--mode', choices=['pretrain','selective'], default='pretrain', help='Training mode')
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    if args.mode == 'pretrain':
+        train_gating_only()
+    else:
+        run_selective_mode()
+
 if __name__ == '__main__':
-    train_gating_only()
+    main()

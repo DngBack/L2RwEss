@@ -18,6 +18,39 @@ from src.data.datasets import get_cifar100_lt_counts
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def fit_temperature_per_expert(logits, labels, max_iter=50):
+    """Simple per-expert temperature scaling (independent) using NLL minimization.
+    Args:
+        logits: [N, E, C] stacked expert logits (on CPU/GPU)
+        labels: [N]
+    Returns:
+        T: [E] temperatures (>0)
+    """
+    E = logits.size(1)
+    device = logits.device
+    T = torch.ones(E, device=device, requires_grad=True)
+    optimizer = torch.optim.LBFGS([T], lr=0.1, max_iter=20)
+    labels = labels.to(device)
+
+    def nll_loss():
+        loss_total = 0.0
+        for e in range(E):
+            scaled = logits[:, e, :] / T[e].clamp_min(1e-4)
+            log_probs = torch.log_softmax(scaled, dim=-1)
+            loss_total = loss_total + torch.nn.functional.nll_loss(log_probs, labels, reduction='mean')
+        return loss_total / E
+
+    def closure():
+        optimizer.zero_grad()
+        loss = nll_loss()
+        loss.backward()
+        return loss
+
+    for _ in range(max_iter):
+        optimizer.step(closure)
+
+    return T.detach().clamp_min(1e-4)
+
 # --- CONFIGURATION ---
 CONFIG = {
     'dataset': {
@@ -35,10 +68,10 @@ CONFIG = {
     'plugin_params': {
         'c': 0.2,  # rejection cost
         'M': 12,   # More iterations for better convergence  
-        'gamma': 0.20,  # Reduced EMA for stability
-        'alpha_min': 0.85,   # Focused bounds around optimal region
-        'alpha_max': 1.15,   # Tighter optimal range
-        'lambda_grid': np.linspace(-1.0, -0.4, 13).tolist(),  # Focused grid in optimal region
+        'gamma': 0.20,  # EMA for stability
+        'alpha_min': 0.80,   # Expanded lower bound for tail lift
+        'alpha_max': 1.60,   # Expanded upper bound for head modulation
+        'lambda_grid': np.linspace(-2.0, 2.0, 41).tolist(),  # Expanded μ grid (symmetric)
         'cov_target': 0.58,  # Lower target for better precision
         'objective': 'balanced',  # 'worst', 'balanced', 'worst_eg', or 'hybrid'
         'hybrid_beta': 0.2,  # weight for balanced term in hybrid objective
@@ -48,6 +81,11 @@ CONFIG = {
         'use_eg_outer': False,  # use EG-outer for worst-group optimization
         'eg_outer_T': 20,  # EG outer iterations
         'eg_outer_xi': 1.0,  # EG step size
+        # --- New selective init options ---
+        'use_selective_init': True,       # load gating_selective.ckpt if available
+        'freeze_alpha': False,            # if True, keep α from selective init
+        'freeze_mu': False,               # if True, skip μ grid optimization (keep μ)
+        'expand_grid_if_frozen_mu': False # ignore lambda grid when mu frozen
     },
     'output': {
         'checkpoints_dir': './checkpoints/argse_balanced_plugin/',
@@ -351,6 +389,7 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     best_t = None
     best_lambda_idx = None  # Track best lambda index for adaptive expansion
     
+    mu_ema = None  # track EMA of best μ across iterations
     for m in range(M):
         print(f"\n--- Plugin Iteration {m+1}/{M} ---")
         for i, mu in enumerate(mu_candidates):
@@ -418,8 +457,20 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
             else:
                 print(f"  λ={lambda_grid[i]:.2f}: {error_type}={error_score:.4f} (t={t_cur:.3f})")
 
+        # EMA stabilize α and re-project to maintain geomean=1 inside expanded bounds
         alpha = (0.5 * alpha + 0.5 * best_alpha).clone()
-        print(f"[Iter {m+1}] Current best: {objective}={best_score:.4f}, t*={best_t:.3f}")
+        log_alpha = alpha.log()
+        alpha = torch.exp(log_alpha - log_alpha.mean())
+        alpha = alpha.clamp(min=CONFIG['plugin_params']['alpha_min'], max=CONFIG['plugin_params']['alpha_max'])
+
+        # EMA stabilize μ (centered implicitly by construction of candidates) using best μ for this iteration
+        if mu_ema is None:
+            mu_ema = best_mu.clone()
+        else:
+            mu_ema = 0.5 * mu_ema + 0.5 * best_mu
+        best_mu = mu_ema.clone()
+
+        print(f"[Iter {m+1}] Current best: {objective}={best_score:.4f}, t*={best_t:.3f} | α={alpha.tolist()} μ={best_mu.tolist()}")
         
         # Adaptive lambda grid expansion when best hits boundary
         if best_lambda_idx is not None and best_lambda_idx in [0, len(lambda_grid)-1]:
@@ -512,31 +563,88 @@ def main():
     
     # 3) Load frozen GSE model (with pre-trained gating if available)
     num_experts = len(CONFIG['experts']['names'])
-    gating_feature_dim = 4 * num_experts
+    # Dynamically infer enriched gating feature dimension (builder outputs 7E+3)
+    with torch.no_grad():
+        dummy = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
+        tmp = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
+        gating_feature_dim = tmp.feature_builder(dummy).size(-1)
+        del tmp
     model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, gating_feature_dim).to(DEVICE)
+    print(f"✅ Dynamic gating feature dimension (plugin): {gating_feature_dim}")
     
     # Try to load pre-trained gating weights
     gating_ckpt_path = Path('./checkpoints/gating_pretrained/') / CONFIG['dataset']['name'] / 'gating_pretrained.ckpt'
     
-    if gating_ckpt_path.exists():
-        print(f"📂 Loading pre-trained gating from {gating_ckpt_path}")
-        gating_ckpt = torch.load(gating_ckpt_path, map_location=DEVICE)
-        model.gating_net.load_state_dict(gating_ckpt['gating_net_state_dict'])
-        # Note: feature_builder has no parameters, so no need to load
-        print("✅ Pre-trained gating loaded successfully!")
-    else:
-        print("⚠️  No pre-trained gating found. Using random initialization.")
-        print("   Consider running train_gating_only.py first for better results.")
+    selective_ckpt_path = gating_ckpt_path.parent / 'gating_selective.ckpt'
+    selective_loaded = False
+    if CONFIG['plugin_params'].get('use_selective_init', False) and selective_ckpt_path.exists():
+        try:
+            sel_ckpt = torch.load(selective_ckpt_path, map_location=DEVICE)
+            model.gating_net.load_state_dict(sel_ckpt['gating_net_state_dict'])
+            print(f"📂 Loaded selective gating checkpoint: {selective_ckpt_path}")
+            # Initialize α, μ, threshold from selective if not frozen logic will apply later
+            init_alpha = sel_ckpt.get('alpha', None)
+            init_mu = sel_ckpt.get('mu', None)
+            init_t = sel_ckpt.get('t', None)
+            selective_loaded = True
+        except Exception as e:
+            print(f"⚠️ Failed to load selective checkpoint ({e}). Fallback to gating_pretrained or random.")
+    if not selective_loaded:
+        if gating_ckpt_path.exists():
+            print(f"📂 Loading pre-trained gating from {gating_ckpt_path}")
+            gating_ckpt = torch.load(gating_ckpt_path, map_location=DEVICE)
+            model.gating_net.load_state_dict(gating_ckpt['gating_net_state_dict'])
+            print("✅ Pre-trained gating loaded successfully!")
+            init_alpha = None
+            init_mu = None
+            init_t = None
+        else:
+            print("⚠️  No gating checkpoint found. Using random initialization.")
+            print("   Consider running train_gating_only.py --mode pretrain or --mode selective first.")
+            init_alpha = None
+            init_mu = None
+            init_t = None
     
     # Initialize α, μ with reasonable values (will be optimized by plugin)
     with torch.no_grad():
         model.alpha.fill_(1.0)
         model.mu.fill_(0.0)
     
-    # 4) Cache η̃ for both splits
-    print("\n=== Caching mixture posteriors ===")
-    eta_S1, y_S1 = cache_eta_mix(model, S1_loader, class_to_group)
-    eta_S2, y_S2 = cache_eta_mix(model, S2_loader, class_to_group) 
+    # 4) (Optional) Temperature scaling per expert on S1 to calibrate logits before caching
+    print("\n=== (Optional) Temperature Scaling Calibration on S1 ===")
+    # Gather raw logits & labels from S1 for calibration
+    all_logits_S1 = []
+    all_labels_S1 = []
+    for logits_b, y_b in S1_loader:
+        all_logits_S1.append(logits_b)
+        all_labels_S1.append(y_b)
+    all_logits_S1 = torch.cat(all_logits_S1).to(DEVICE)
+    all_labels_S1 = torch.cat(all_labels_S1).to(DEVICE)
+    T_per_expert = fit_temperature_per_expert(all_logits_S1, all_labels_S1)
+    print(f"Calibrated temperatures per expert: {T_per_expert.tolist()}")
+
+    # Apply temperatures in-place for caching
+    def apply_t(logits, T):
+        return logits / T.view(1, -1, 1)
+
+    # Replace DataLoader stacking via recalibration (create new tensors)
+    calibrated_S1 = TensorDataset(apply_t(all_logits_S1, T_per_expert).cpu(), all_labels_S1.cpu())
+    S1_loader_cal = DataLoader(calibrated_S1, batch_size=256, shuffle=False)
+
+    # Calibrate S2 as well
+    all_logits_S2 = []
+    all_labels_S2 = []
+    for logits_b, y_b in S2_loader:
+        all_logits_S2.append(logits_b)
+        all_labels_S2.append(y_b)
+    all_logits_S2 = torch.cat(all_logits_S2).to(DEVICE)
+    all_labels_S2 = torch.cat(all_labels_S2).to(DEVICE)
+    calibrated_S2 = TensorDataset(apply_t(all_logits_S2, T_per_expert).cpu(), all_labels_S2.cpu())
+    S2_loader_cal = DataLoader(calibrated_S2, batch_size=256, shuffle=False)
+
+    print("\n=== Caching calibrated mixture posteriors ===")
+    eta_S1, y_S1 = cache_eta_mix(model, S1_loader_cal, class_to_group)
+    eta_S2, y_S2 = cache_eta_mix(model, S2_loader_cal, class_to_group) 
     
     print(f"✅ Cached η̃_S1: {eta_S1.shape}, y_S1: {y_S1.shape}")
     print(f"✅ Cached η̃_S2: {eta_S2.shape}, y_S2: {y_S2.shape}")
@@ -591,6 +699,22 @@ def main():
         
     else:
         print(f"\n=== Running GSE-Balanced Plugin (target_coverage={cov_target:.2f}, objective={objective}) ===")
+        # If selective init loaded and freeze flags set, adapt grid / parameters
+        lambda_grid_cfg = CONFIG['plugin_params']['lambda_grid']
+        if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False):
+            print("🔒 freeze_mu=True -> skipping μ grid search, using μ from selective checkpoint")
+            # Set grid to single dummy to keep code path consistent
+            lambda_grid_cfg = [0.0]
+            if isinstance(init_mu, torch.Tensor):
+                mu_init_tensor = init_mu.to(DEVICE)
+            else:
+                mu_init_tensor = None
+        alpha_init = init_alpha if (selective_loaded and init_alpha is not None and CONFIG['plugin_params'].get('freeze_alpha', False)) else None
+        if alpha_init is not None:
+            print(f"🔒 freeze_alpha=True -> using α from selective init: {alpha_init.tolist()}")
+        if selective_loaded and init_t is not None:
+            print(f"ℹ️ Using selective raw-margin threshold init t={init_t:.4f} (will refit per plugin iteration)")
+
         alpha_star, mu_star, best_score, t_star = gse_balanced_plugin(
             eta_S1=eta_S1.to(DEVICE),
             y_S1=y_S1.to(DEVICE),
@@ -598,9 +722,10 @@ def main():
             y_S2=y_S2.to(DEVICE),
             class_to_group=class_to_group.to(DEVICE),
             K=num_groups,
-            c=None,  # biến này không còn dùng bên trong plugin
+            c=None,
             M=CONFIG['plugin_params']['M'],
-            lambda_grid=CONFIG['plugin_params']['lambda_grid'],
+            lambda_grid=lambda_grid_cfg,
+            alpha_init=alpha_init.to(DEVICE) if isinstance(alpha_init, torch.Tensor) else None,
             gamma=CONFIG['plugin_params']['gamma'],
             cov_target=CONFIG['plugin_params']['cov_target'],
             objective=CONFIG['plugin_params']['objective'],
@@ -609,13 +734,16 @@ def main():
             use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
             tie_break_balanced=CONFIG['plugin_params']['tie_break_balanced'],
         )
+        # If μ was frozen, overwrite with init μ
+        if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False) and 'mu_init_tensor' in locals() and mu_init_tensor is not None:
+            mu_star = mu_init_tensor.cpu()
         source_info = f'gse_{objective}_plugin'
         extra_info = {}
     
     print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")
 
     # Optional: Fit per-group thresholds for better worst-group performance
-    print("\n=== Fitting Per-Group Thresholds (Mondrian) on Correct Predictions ===")
+    print("\n=== Fitting Per-Group Thresholds (Mondrian) on ALL samples (raw margins) ===")
     
     # Ensure all tensors are on the same device for computation
     eta_S1_device = eta_S1.to(DEVICE)
@@ -626,18 +754,17 @@ def main():
     raw_S1 = compute_raw_margin(eta_S1_device, alpha_star_device, mu_star_device, class_to_group_device)
     preds_S1 = (alpha_star_device[class_to_group_device] * eta_S1_device).argmax(dim=1).cpu()
     pred_groups_S1 = class_to_group[preds_S1.cpu()].cpu()
-    correct_S1 = (preds_S1.cpu() == y_S1.cpu())  # Correct predictions mask
-    
-    # Set coverage target per group - more aggressive for tail to reduce FP
+
+    # New recommended group coverage targets (can adjust): e.g., head 0.55, tail 0.45
     if num_groups == 2:
-        target_cov_by_group = [0.58, 0.42]  # head=0.58, tail=0.42 (more aggressive)
-        print("Using different coverage targets: head=0.58, tail=0.42 (fitted on correct predictions only)")
+        target_cov_by_group = [0.55, 0.45]
+        print("Using τ_k targets: head=0.55, tail=0.45 (ALL samples)")
     else:
         target_cov_by_group = [CONFIG['plugin_params']['cov_target']] * num_groups
-    
+
     from src.train.per_group_threshold import fit_group_thresholds_from_raw
-    t_group = fit_group_thresholds_from_raw(raw_S1.cpu(), pred_groups_S1, target_cov_by_group, K=num_groups, correct_mask=correct_S1)
-    print(f"Per-group thresholds: {t_group.tolist()}")
+    t_group = fit_group_thresholds_from_raw(raw_S1.cpu(), pred_groups_S1, target_cov_by_group, K=num_groups)
+    print(f"Per-group thresholds (all-sample fit): {t_group.tolist()}")
     
     # 7) Save results
     print("\n🎉 GSE-Balanced Plugin Complete!")
