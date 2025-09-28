@@ -54,7 +54,7 @@ CONFIG = {
         'data_root': './data',
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
-        'num_groups': 2,  # Head: 0-49, Tail: 50-99
+        'num_groups': 2,
     },
     'train_params': {
         'batch_size': 128,

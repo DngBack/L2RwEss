@@ -11,9 +11,9 @@ import collections
 
 # Import our custom modules
 from src.models.argse import AR_GSE
-from src.models.primal_dual import primal_dual_step
+from src.models.primal_dual_fixed_point import primal_dual_step_fixed_point, compute_per_group_acceptance_rates
 from src.models.surrogate_losses import selective_cls_loss
-from src.data.groups import get_class_to_group, get_class_to_group_by_threshold
+from src.data.groups import get_class_to_group_by_threshold
 from src.data.datasets import get_cifar100_lt_counts
 
 # --- CONFIGURATION (sẽ được thay thế bằng Hydra) ---
@@ -34,29 +34,29 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'argse_params': {
-        'mode': 'balanced',      # 'balanced' or 'worst'
+        'mode': 'worst',      # 'balanced' or 'worst'
         'epochs': 100,
         'batch_size': 256,
-        'c': 0.7,                # reject cost (cao -> ít reject hơn)
+        'c': 0.2,                # reject cost (cao -> ít reject hơn)
         'alpha_clip': 5e-2,      # α_min
         'lambda_ent': 0.0,       # TẮT entropy reg để tránh ép gating ~ uniform
     },
     'optimizers': {
         'phi_lr': 1e-2,          # LR gating nhẹ để ổn định
-        'alpha_lr': 5e-3,        # LR cho α (riêng)
-        'mu_lr': 1e-2,           # LR cho μ (riêng)
-        'rho': 5e-3,             # dual step cho Λ
+        'mu_lr': 5e-4,           # LR cho μ (thấp hơn, freeze 5-10 epoch đầu)
+        'rho': 0.0,              # TẮT dual update vì dùng fixed-point alpha
     },
     'scheduler': {
-        'tau_start': 1.0,        # cố định τ=1.0 để tránh bão hoà sigmoid
+        'tau_start': 0.25,       # Bắt đầu τ thấp để margin normalization hoạt động
         'tau_end': 1.0,
-        'tau_warmup_epochs': 0,
+        'tau_warmup_epochs': 10, # Tăng τ dần trong 10 epoch đầu
+        'mu_freeze_epochs': 5,   # Freeze μ trong 5 epoch đầu
     },
     'worst_group_params': {
         'eg_xi': 1.0,            # cho chế độ 'worst'
     },
     'output': {
-        'checkpoints_dir': './checkpoints/argse_balanced/',
+        'checkpoints_dir': './checkpoints/argse_worst/',
     },
     'seed': 42
 }
@@ -186,25 +186,24 @@ def main():
     print(f"✅ Loaded training data: {len(train_loader)} batches")
     print(f"✅ Loaded validation data: {len(val_loader)} batches")
 
-    # 2) Grouping
+    # 2) Grouping - Always use threshold-based grouping
     class_counts = get_cifar100_lt_counts(imb_factor=100)
+    
     if CONFIG['grouping']['method'] == 'threshold':
-        print(f"Using threshold-based grouping with threshold={CONFIG['grouping']['threshold']}")
-        class_to_group = get_class_to_group_by_threshold(
-            class_counts, threshold=CONFIG['grouping']['threshold']
-        ).to(DEVICE)
-        head = (class_to_group == 0).sum().item()
-        tail = (class_to_group == 1).sum().item()
-        print(f"Groups created: {head} head classes (>{CONFIG['grouping']['threshold']} samples), "
-              f"{tail} tail classes (<= {CONFIG['grouping']['threshold']})")
+        threshold = CONFIG['grouping']['threshold']
+        print(f"Using threshold-based grouping with threshold={threshold}")
     else:
-        print(f"Using ratio-based grouping with head_ratio={CONFIG['grouping']['head_ratio']}")
-        class_to_group = get_class_to_group(
-            class_counts, K=CONFIG['grouping']['K'], head_ratio=CONFIG['grouping']['head_ratio']
-        ).to(DEVICE)
-        head = int(CONFIG['dataset']['num_classes'] * CONFIG['grouping']['head_ratio'])
-        tail = CONFIG['dataset']['num_classes'] - head
-        print(f"Groups created: {head} head classes, {tail} tail classes")
+        # Convert head_ratio to equivalent threshold for backward compatibility
+        sorted_counts = sorted(class_counts, reverse=True)
+        head_classes = int(CONFIG['dataset']['num_classes'] * CONFIG['grouping']['head_ratio'])
+        threshold = sorted_counts[head_classes - 1] if head_classes > 0 else 0
+        print(f"Converting head_ratio={CONFIG['grouping']['head_ratio']} to threshold={threshold}")
+    
+    class_to_group = get_class_to_group_by_threshold(class_counts, threshold=threshold).to(DEVICE)
+    head = (class_to_group == 0).sum().item()
+    tail = (class_to_group == 1).sum().item()
+    print(f"Groups created: {head} head classes (>{threshold} samples), "
+          f"{tail} tail classes (<= {threshold} samples)")
     num_groups = class_to_group.max().item() + 1
 
     # 3) Model & optimizers
@@ -212,25 +211,39 @@ def main():
     gating_feature_dim = 4 * num_experts
     model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, gating_feature_dim).to(DEVICE)
 
-    # init α, μ ổn định hơn
+    # Initialize parameters more carefully
     with torch.no_grad():
+        # Initialize mu with small noise and zero mean
         model.mu.add_(0.01 * torch.randn_like(model.mu))
         model.mu.sub_(model.mu.mean())  # zero-mean
+        
+        # Initialize alpha to 1 with small noise, then normalize
         noise = 0.05 * torch.randn_like(model.alpha)
         model.alpha.copy_(torch.exp(noise))
         log_alpha = model.alpha.log()
         model.alpha.copy_(torch.exp(log_alpha - log_alpha.mean()))  # geomean(α)=1
+        
+        # Initialize EMA buffer
+        model.alpha_ema.copy_(model.alpha)
 
+    # Separate optimizers: gating network + mu only (alpha uses fixed-point)
     optimizers = {
         'phi': optim.Adam(model.gating_net.parameters(), lr=CONFIG['optimizers']['phi_lr']),
-        'alpha_mu': optim.Adam([
-            {'params': [model.alpha], 'lr': CONFIG['optimizers']['alpha_lr']},
-            {'params': [model.mu],    'lr': CONFIG['optimizers']['mu_lr']},
-        ])
+        'mu': optim.Adam([model.mu], lr=CONFIG['optimizers']['mu_lr']),
     }
 
-    # 4) Training state
-    tau = CONFIG['scheduler']['tau_start']  # = tau_end = 1.0
+    # 4) Training state và tau scheduling
+    tau_start = CONFIG['scheduler']['tau_start']
+    tau_end = CONFIG['scheduler']['tau_end'] 
+    tau_warmup_epochs = CONFIG['scheduler']['tau_warmup_epochs']
+    mu_freeze_epochs = CONFIG['scheduler']['mu_freeze_epochs']
+    
+    def get_tau(epoch):
+        if tau_warmup_epochs == 0:
+            return tau_end
+        progress = min(epoch / tau_warmup_epochs, 1.0)
+        return tau_start + (tau_end - tau_start) * progress
+    
     beta = torch.ones(num_groups, device=DEVICE) / num_groups
 
     # 5) Train loop
@@ -241,6 +254,18 @@ def main():
         print(f"\n--- Epoch {epoch+1}/{CONFIG['argse_params']['epochs']} ---")
         model.train()
         epoch_stats = collections.defaultdict(list)
+        
+        # Update tau scheduling
+        tau = get_tau(epoch)
+        
+        # Freeze mu for first few epochs
+        mu_frozen = epoch < mu_freeze_epochs
+        if mu_frozen:
+            for param in optimizers['mu'].param_groups[0]['params']:
+                param.requires_grad_(False)
+        else:
+            for param in optimizers['mu'].param_groups[0]['params']:
+                param.requires_grad_(True)
 
         for batch in tqdm(train_loader, desc="Training"):
             params = {
@@ -253,7 +278,7 @@ def main():
                 'alpha_clip': CONFIG['argse_params']['alpha_clip'],
                 'rho': CONFIG['optimizers']['rho'],
             }
-            stats, _ = primal_dual_step(model, batch, optimizers, selective_cls_loss, params)
+            stats, _ = primal_dual_step_fixed_point(model, batch, optimizers, selective_cls_loss, params)
 
             # NaN guard
             if (not np.isfinite(stats['loss_total'])) or (not np.isfinite(stats['mean_margin'])):
@@ -264,11 +289,12 @@ def main():
             for k, v in stats.items():
                 epoch_stats[k].append(v)
 
-        # Log
+        # Log với thông tin mới
         cov = np.mean(epoch_stats['mean_coverage']) if epoch_stats['mean_coverage'] else float('nan')
         mrg = np.mean(epoch_stats['mean_margin'])   if epoch_stats['mean_margin']   else float('nan')
         tot = np.mean(epoch_stats['loss_total'])    if epoch_stats['loss_total']    else float('nan')
-        print(f"Epoch {epoch+1} | Tau: {tau:.2f} | Loss: {tot:.4f} | Coverage: {cov:.3f} | Margin: {mrg:.3f}")
+        mu_status = "FROZEN" if mu_frozen else "ACTIVE"
+        print(f"Epoch {epoch+1} | Tau: {tau:.2f} | μ: {mu_status} | Loss: {tot:.4f} | Coverage: {cov:.3f} | Margin: {mrg:.3f}")
         print(f"[alpha] mean={model.alpha.mean().item():.3f} "
               f"std={model.alpha.std().item():.3f} "
               f"min={model.alpha.min().item():.3f} "
@@ -276,9 +302,15 @@ def main():
         print(f"[mu]    mean={model.mu.mean().item():.3f} "
               f"std={model.mu.std().item():.3f} "
               f"min={model.mu.min().item():.3f} "
-              f"max={model.mu.max().item():.3f})")
+              f"max={model.mu.max().item():.3f}")
+        
+        # Compute per-group acceptance rates for monitoring  
+        group_rates = compute_per_group_acceptance_rates(
+            model, val_loader, CONFIG['argse_params']['c'], class_to_group
+        )
+        print(f"Per-group acceptance rates: {[f'{rate:.3f}' for rate in group_rates]}")
 
-        # 6) Eval
+        # 6) Eval với tau=1.0 cố định
         val = eval_epoch(model, val_loader, CONFIG['argse_params']['c'], class_to_group, tau_eval=1.0)
         key = 'worst_error' if CONFIG['argse_params']['mode'] == 'worst' else 'balanced_error'
         cur = val[key]

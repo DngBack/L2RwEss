@@ -23,6 +23,10 @@ class AR_GSE(nn.Module):
         
         # Dual variables (not optimized by SGD, but part of state)
         self.register_buffer('Lambda', torch.zeros(num_groups))
+        
+        # EMA buffers for stable training
+        self.register_buffer('alpha_ema', torch.ones(num_groups))
+        self.register_buffer('m_std', torch.tensor(1.0))  # margin std for normalization
 
     def forward(self, expert_logits, c, tau, class_to_group):
         """
@@ -50,21 +54,39 @@ class AR_GSE(nn.Module):
         eta_mix = torch.einsum('be,bec->bc', w, expert_posteriors)  # [B, C]
         eta_mix = torch.clamp(eta_mix, min=1e-8, max=1.0-1e-8)  # Stability + valid probabilities
 
-        # 4. Margin & Acceptance Probability
-        raw_margin = self.raw_margin(eta_mix, class_to_group)  # Raw margin without c
+        # 4. Margin & Acceptance Probability  
+        # Chỉ dùng một hàm selective_margin để tránh drift
+        raw_margin = self.selective_margin(eta_mix, 0.0, class_to_group)  # c=0 for raw
         margin = raw_margin - c  # Final margin with rejection cost
-        s_tau = torch.sigmoid(tau * margin)
+        
+        # Normalize margin by EMA std to help gradient flow
+        if self.training:
+            # Update margin std EMA during training
+            self.m_std.mul_(0.99).add_(0.01 * margin.std().detach())
+        m_norm = margin / (self.m_std + 1e-6)
+        s_tau = torch.sigmoid(tau * m_norm)
 
         return {
             'eta_mix': eta_mix,
             's_tau': s_tau,
             'w': w,
             'margin': margin,
-            'raw_margin': raw_margin,  # Add raw margin for RC curve evaluation
+            'raw_margin': raw_margin,
         }
 
     def selective_margin(self, eta_mix, c, class_to_group):
-        """Calculates the selective margin m(x)."""
+        """
+        Calculates the selective margin m(x) = max_score - threshold.
+        Unified function to avoid drift between raw_margin and margin calculations.
+        
+        Args:
+            eta_mix: [B, C] mixture probabilities
+            c: rejection cost (use 0.0 for raw margin)  
+            class_to_group: [C] class to group mapping
+            
+        Returns:
+            margin: [B] selective margin scores
+        """
         device = eta_mix.device
         alpha = self.alpha.to(device)
         mu = self.mu.to(device)
@@ -75,36 +97,43 @@ class AR_GSE(nn.Module):
         max_score, _ = score_per_class.max(dim=1)  # [B]
         
         # Threshold: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x) - c
-        # Compute (1/alpha - mu) for each class
-        inv_alpha_minus_mu = 1.0 / alpha[class_to_group] - mu[class_to_group]  # [C]
-        inv_alpha_minus_mu = inv_alpha_minus_mu.unsqueeze(0).expand(eta_mix.size(0), -1)  # [B, C]
-        
-        # Weighted sum: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x)
-        weighted_sum = (inv_alpha_minus_mu * eta_mix).sum(dim=1)  # [B]
-        threshold = weighted_sum - c  # [B]
+        # Vectorized computation to avoid loops
+        coeff = 1.0 / alpha[class_to_group] - mu[class_to_group]  # [C]
+        threshold = (coeff.unsqueeze(0) * eta_mix).sum(dim=1) - c  # [B]
         
         # Margin: score - threshold  
-        # Positive margin means accept, negative means reject
         margin = max_score - threshold
         return margin
-
-    def raw_margin(self, eta_mix, class_to_group):
-        """Calculates the raw margin m_raw(x) without rejection cost c."""
-        device = eta_mix.device
-        alpha = self.alpha.to(device)
-        mu = self.mu.to(device)
-        class_to_group = class_to_group.to(device)
-
-        # Score: max_y alpha_g(y) * eta_y 
-        score_per_class = alpha[class_to_group] * eta_mix  # [B, C]
-        max_score, _ = score_per_class.max(dim=1)  # [B]
+    
+    def update_alpha_fixed_point(self, s_tau, labels, class_to_group, alpha_clip=(5e-2, 2.0)):
+        """
+        Update alpha using fixed-point matching instead of SGD to avoid tail collapse.
         
-        # Threshold WITHOUT c: Σ_{y'} (1/α_{grp(y')} - μ_{grp(y')}) η̃_{y'}(x)
-        inv_alpha_minus_mu = 1.0 / alpha[class_to_group] - mu[class_to_group]  # [C]
-        inv_alpha_minus_mu = inv_alpha_minus_mu.unsqueeze(0).expand(eta_mix.size(0), -1)  # [B, C]
-        
-        weighted_sum = (inv_alpha_minus_mu * eta_mix).sum(dim=1)  # [B]
-        
-        # Raw margin: score - threshold (no c subtracted)
-        raw_margin = max_score - weighted_sum
-        return raw_margin
+        Args:
+            s_tau: [B] acceptance probabilities
+            labels: [B] ground truth labels  
+            class_to_group: [C] class to group mapping
+            alpha_clip: (min, max) clipping bounds for alpha
+        """
+        with torch.no_grad():
+            K = self.num_groups
+            
+            # One-hot encoding for group membership based on LABELS
+            group_labels = class_to_group[labels]  # [B] 
+            one_hot = torch.nn.functional.one_hot(group_labels, num_classes=K).float()  # [B, K]
+            
+            # Compute per-group acceptance rate: (1/B) Σ s_tau * 1{y∈G_k}
+            joint = (s_tau.unsqueeze(1) * one_hot).mean(dim=0)  # [K]
+            alpha_hat = K * joint  # [K] target alpha_k
+            
+            # EMA update for stability
+            self.alpha_ema.mul_(0.9).add_(0.1 * alpha_hat.to(self.alpha_ema.device))
+            
+            # Project: clamp + normalize geomean=1
+            alpha_new = self.alpha_ema.clone()
+            alpha_new.clamp_(min=alpha_clip[0], max=alpha_clip[1])
+            log_alpha = alpha_new.log()
+            alpha_new = torch.exp(log_alpha - log_alpha.mean())
+            
+            # Update model parameters
+            self.alpha.data.copy_(alpha_new)
