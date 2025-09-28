@@ -1,0 +1,169 @@
+{
+  "results": {
+    "balanced": {
+      "method": "Balanced Plugin",
+      "parameters": {
+        "alpha": [
+          1.1568284034729004,
+          0.86449134349823
+        ],
+        "mu": [
+          -0.44999998807907104,
+          0.44999998807907104
+        ],
+        "threshold": -0.5931054949760437
+      },
+      "plugin_metrics": {
+        "coverage": 0.5831946730613708,
+        "balanced_error": 0.3684762716293335,
+        "worst_error": 0.5625,
+        "head_error": 0.174452543258667,
+        "tail_error": 0.5625,
+        "overall_accuracy": 0.8166904449462891
+      },
+      "coverage_sweep": {
+        "target_0.5": {
+          "coverage": 0.5,
+          "balanced_error": 0.34883567690849304,
+          "worst_error": 0.5769230723381042,
+          "head_error": 0.12074828147888184,
+          "tail_error": 0.5769230723381042,
+          "overall_accuracy": 0.8693843483924866
+        },
+        "target_0.58": {
+          "coverage": 0.579866886138916,
+          "balanced_error": 0.37579579651355743,
+          "worst_error": 0.5806451737880707,
+          "head_error": 0.1709464192390442,
+          "tail_error": 0.5806451737880707,
+          "overall_accuracy": 0.8199425935745239
+        },
+        "target_0.6": {
+          "coverage": 0.599833607673645,
+          "balanced_error": 0.388577863574028,
+          "worst_error": 0.5882352888584137,
+          "head_error": 0.18892043828964233,
+          "tail_error": 0.5882352888584137,
+          "overall_accuracy": 0.8016643524169922
+        },
+        "target_0.7": {
+          "coverage": 0.7000831961631775,
+          "balanced_error": 0.44611991941928864,
+          "worst_error": 0.6500000059604645,
+          "head_error": 0.2422398328781128,
+          "tail_error": 0.6500000059604645,
+          "overall_accuracy": 0.7480689287185669
+        },
+        "target_0.8": {
+          "coverage": 0.80033278465271,
+          "balanced_error": 0.49255676567554474,
+          "worst_error": 0.705882340669632,
+          "head_error": 0.2792311906814575,
+          "tail_error": 0.705882340669632,
+          "overall_accuracy": 0.7094594836235046
+        }
+      }
+    },
+    "eg_worst": {
+      "method": "EG-Outer Worst",
+      "parameters": {
+        "alpha": [
+          1.0,
+          1.0
+        ],
+        "mu": [
+          -0.25,
+          0.25
+        ],
+        "threshold": -0.2549144571838591,
+        "beta": [
+          0.005006745457649231,
+          0.994993269443512
+        ]
+      },
+      "plugin_metrics": {
+        "coverage": 0.5574043393135071,
+        "balanced_error": 0.5324215888977051,
+        "worst_error": 0.620398759841919,
+        "head_error": 0.620398759841919,
+        "tail_error": 0.4444444179534912,
+        "overall_accuracy": 0.38432836532592773
+      },
+      "coverage_sweep": {
+        "target_0.5": {
+          "coverage": 0.5,
+          "balanced_error": 0.5166700184345245,
+          "worst_error": 0.6215753555297852,
+          "head_error": 0.6215753555297852,
+          "tail_error": 0.4117646813392639,
+          "overall_accuracy": 0.3843593895435333
+        },
+        "target_0.58": {
+          "coverage": 0.579866886138916,
+          "balanced_error": 0.5421836823225021,
+          "worst_error": 0.6249078810214996,
+          "head_error": 0.6249078810214996,
+          "tail_error": 0.45945948362350464,
+          "overall_accuracy": 0.37948349118232727
+        },
+        "target_0.6": {
+          "coverage": 0.599833607673645,
+          "balanced_error": 0.5421852618455887,
+          "worst_error": 0.6249110400676727,
+          "head_error": 0.6249110400676727,
+          "tail_error": 0.45945948362350464,
+          "overall_accuracy": 0.3793342709541321
+        },
+        "target_0.7": {
+          "coverage": 0.7000831961631775,
+          "balanced_error": 0.5704275816679001,
+          "worst_error": 0.6658551394939423,
+          "head_error": 0.6658551394939423,
+          "tail_error": 0.4750000238418579,
+          "overall_accuracy": 0.3386809229850769
+        },
+        "target_0.8": {
+          "coverage": 0.7999168038368225,
+          "balanced_error": 0.5871671885251999,
+          "worst_error": 0.707667738199234,
+          "head_error": 0.707667738199234,
+          "tail_error": 0.46666663885116577,
+          "overall_accuracy": 0.2979719042778015
+        }
+      }
+    },
+    "mondrian": {
+      "global": {
+        "coverage": 0.579866886138916,
+        "balanced_error": 0.37579579651355743,
+        "worst_error": 0.5806451737880707,
+        "head_error": 0.1709464192390442,
+        "tail_error": 0.5806451737880707,
+        "overall_accuracy": 0.8199425935745239
+      },
+      "mondrian": {
+        "coverage": 0.579866886138916,
+        "balanced_error": 0.41278640925884247,
+        "worst_error": 0.6585365831851959,
+        "head_error": 0.167036235332489,
+        "tail_error": 0.6585365831851959,
+        "overall_accuracy": 0.8185079097747803
+      },
+      "group_thresholds": {
+        "0": -0.5861172080039978,
+        "1": -0.7031487822532654
+      },
+      "improvement": {
+        "coverage": 0.0,
+        "balanced_error": -0.036990612745285034,
+        "worst_error": -0.07789140939712524
+      }
+    }
+  },
+  "summary": "Comprehensive evaluation of GSE technical improvements",
+  "methods_evaluated": [
+    "balanced",
+    "eg_worst",
+    "mondrian"
+  ]
+}

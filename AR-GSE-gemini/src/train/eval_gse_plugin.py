@@ -18,7 +18,7 @@ from src.metrics.calibration import calculate_ece
 from src.metrics.bootstrap import bootstrap_ci
 
 # Import plugin functions
-from src.train.gse_balanced_plugin import compute_margin, accepted_and_pred
+from src.train.gse_balanced_plugin import compute_margin
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -39,8 +39,8 @@ CONFIG = {
         'coverage_points': [0.7, 0.8, 0.9],
         'bootstrap_n': 1000,
     },
-    'plugin_checkpoint': './checkpoints/argse_balanced_plugin/cifar100_lt_if100/gse_balanced_plugin.ckpt',
-    'output_dir': './results_balanced_plugin/cifar100_lt_if100',
+    'plugin_checkpoint': './checkpoints/argse_worst_eg/cifar100_lt_if100/gse_balanced_plugin.ckpt',
+    'output_dir': './results_worst_plugin/cifar100_lt_if100',
     'seed': 42
 }
 
@@ -215,13 +215,18 @@ def main():
     mu_star = checkpoint['mu'].to(DEVICE)
     class_to_group = checkpoint['class_to_group'].to(DEVICE)
     num_groups = checkpoint['num_groups']
-    threshold = checkpoint.get('threshold', checkpoint.get('c'))  # Backward compatibility
+    plugin_threshold = checkpoint.get('threshold', checkpoint.get('c'))  # Backward compatibility
     
     print("✅ Loaded optimal parameters:")
     print(f"   α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"   μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
-    print(f"   raw-margin threshold t* = {threshold:.3f}")
-    print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
+    print(f"   raw-margin threshold t* = {plugin_threshold:.3f}")
+    if 'best_score' in checkpoint:
+        print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
+    if 'source' in checkpoint:
+        print(f"   Source: {checkpoint['source']}")
+    if 'improvement' in checkpoint:
+        print(f"   Expected improvement: {checkpoint['improvement']:.1f}%")
     
     # 2. Set up model with optimal parameters
     num_experts = len(CONFIG['experts']['names'])
@@ -251,19 +256,34 @@ def main():
     print("🔮 Computing test predictions...")
     eta_mix = get_mixture_posteriors(model, test_logits)
     
-    # Compute margins and predictions using plugin functions
-    margins_raw = compute_margin(eta_mix, alpha_star.cpu(), mu_star.cpu(), 0.0, class_to_group.cpu())
+    # Ensure all tensors are on CPU for consistent computation
+    alpha_star_cpu = alpha_star.cpu()
+    mu_star_cpu = mu_star.cpu()
+    class_to_group_cpu = class_to_group.cpu()
     
-    accepted, preds, _ = accepted_and_pred(eta_mix, alpha_star.cpu(), mu_star.cpu(), threshold, class_to_group.cpu())
+    # Compute raw margins and predictions
+    margins_raw = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    preds = (alpha_star_cpu[class_to_group_cpu] * eta_mix).argmax(dim=1)
     
-    print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+    # Use per-group thresholds if available, otherwise use global threshold
+    t_group = checkpoint.get('t_group', None)
+    if t_group is not None:
+        pred_groups = class_to_group_cpu[preds]
+        from src.train.per_group_threshold import accept_with_group_thresholds
+        accepted = accept_with_group_thresholds(margins_raw, pred_groups, t_group.cpu())
+        print(f"✅ Using per-group thresholds: {t_group.tolist()}")
+        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+    else:
+        accepted = margins_raw >= plugin_threshold
+        print(f"✅ Using global threshold: {plugin_threshold:.3f}")
+        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
     
     # 5. Calculate metrics
     print("📈 Calculating metrics...")
     results = {}
     
     # 5.1 RC Curve and AURC (using raw margins for fair comparison)
-    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group.cpu(), num_groups)
+    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
     rc_df.to_csv(output_dir / 'rc_curve.csv', index=False)
     
     aurc_bal = calculate_aurc(rc_df, 'balanced_error')
@@ -273,7 +293,7 @@ def main():
     print(f"AURC (Balanced): {aurc_bal:.4f}, AURC (Worst): {aurc_wst:.4f}")
     
     # 5.2 RC Curve 0.2-1.0 range
-    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group.cpu(), num_groups)
+    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
     rc_df_02.to_csv(output_dir / 'rc_curve_02_10.csv', index=False)
     
     aurc_bal_02 = calculate_aurc_from_02(rc_df_02, 'balanced_error')
@@ -284,7 +304,7 @@ def main():
     
     # 5.3 Bootstrap CI for AURC
     def aurc_metric_func(m, p, labels):
-        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group.cpu(), num_groups, num_points=51)
+        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group_cpu, num_groups, num_points=51)
         return calculate_aurc(rc_df_boot, 'balanced_error')
 
     mean_aurc, lower, upper = bootstrap_ci(
@@ -296,24 +316,24 @@ def main():
     # 5.4 Metrics at fixed coverage points (using raw margins)
     results_at_coverage = {}
     for cov_target in CONFIG['eval_params']['coverage_points']:
-        threshold = torch.quantile(margins_raw, 1.0 - cov_target)
-        accepted_mask = margins_raw >= threshold
+        thr_cov = torch.quantile(margins_raw, 1.0 - cov_target)
+        accepted_mask = margins_raw >= thr_cov   # >= giúp bền vững khi có ties
         
-        metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group.cpu(), num_groups)
+        metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group_cpu, num_groups)
         results_at_coverage[f'cov_{cov_target}'] = metrics
         print(f"Metrics @ {metrics['coverage']:.2f} coverage: "
               f"Bal.Err={metrics['balanced_error']:.4f}, Worst.Err={metrics['worst_error']:.4f}")
     results['metrics_at_coverage'] = results_at_coverage
     
     # 5.5 Plugin-specific metrics (at optimal threshold)
-    plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group.cpu(), num_groups)
+    plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group_cpu, num_groups)
     results['plugin_metrics_at_threshold'] = plugin_metrics
-    print(f"Plugin metrics @ t*={threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
+    print(f"Plugin metrics @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
           f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
     
     # 5.5a Detailed Group-wise Analysis
     analyze_group_performance(eta_mix, preds, test_labels, accepted,
-                             alpha_star, mu_star, threshold, class_to_group, num_groups)
+                             alpha_star_cpu, mu_star_cpu, plugin_threshold, class_to_group_cpu, num_groups)
     
     # 5.6 ECE
     ece = calculate_ece(eta_mix, test_labels)
@@ -325,9 +345,9 @@ def main():
     selective_risks = {}
     for c_cost in [0.3, 0.5, 0.7]:
         bal_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                            class_to_group.cpu(), num_groups, "balanced")
+                                            class_to_group_cpu, num_groups, "balanced")
         worst_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                              class_to_group.cpu(), num_groups, "worst")
+                                              class_to_group_cpu, num_groups, "worst")
         selective_risks[f'cost_{c_cost}'] = {'balanced': bal_risk, 'worst': worst_risk}
         print(f"  Cost c={c_cost:.2f}: Balanced={bal_risk:.4f}, Worst={worst_risk:.4f}")
     results['selective_risks'] = selective_risks
@@ -373,12 +393,12 @@ def main():
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Test samples: {num_test_samples}")
     print(f"Optimal parameters: α*={alpha_star.cpu().tolist()}, μ*={mu_star.cpu().tolist()}")
-    print(f"Raw-margin threshold (fitted on S1): t* = {threshold:.3f}")
+    print(f"Raw-margin threshold (fitted on S1): t* = {plugin_threshold:.3f}")
     print()
     print("Key Results:")
     print(f"• AURC (Balanced): {aurc_bal:.4f}")
     print(f"• AURC (Worst): {aurc_wst:.4f}") 
-    print(f"• Plugin @ t*={threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
+    print(f"• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
           f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
     print(f"• ECE: {ece:.4f}")
     print("="*60)
