@@ -13,7 +13,7 @@ class Expert(nn.Module):
     """
     
     def __init__(self, num_classes=100, backbone_name='cifar_resnet32', 
-                 dropout_rate=0.0, init_weights=True):
+                dropout_rate=0.0, init_weights=True):
         super(Expert, self).__init__()
         
         # Initialize backbone
@@ -27,7 +27,7 @@ class Expert(nn.Module):
             self.fc = nn.Linear(feature_dim, num_classes)
         else:
             raise ValueError(f"Backbone '{backbone_name}' not recognized. "
-                           f"Supported: 'cifar_resnet32', 'resnet32'")
+                        f"Supported: 'cifar_resnet32', 'resnet32'")
         
         # Temperature scaling parameter for calibration
         self.temperature = nn.Parameter(torch.ones(1), requires_grad=False)

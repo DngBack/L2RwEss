@@ -722,9 +722,6 @@ def main():
                                        alpha_star.to(DEVICE), mu_star.to(DEVICE), 
                                        t_group_star.to(DEVICE), class_to_group.to(DEVICE), num_groups)
         
-        # Store EG history in results
-        source_info = 'worst_eg_outer'
-        extra_info = {'beta': beta_star, 'eg_history': eg_hist}
         
     else:
         print(f"\n=== Running GSE-Balanced Plugin (target_coverage={cov_target:.2f}, objective={objective}) ===")
@@ -767,35 +764,29 @@ def main():
         # If μ was frozen, overwrite with init μ
         if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False) and 'mu_init_tensor' in locals() and mu_init_tensor is not None:
             mu_star = mu_init_tensor.cpu()
-        source_info = f'gse_{objective}_plugin'
-        extra_info = {}
     
     # print(f"Best raw-margin threshold t* (fitted on S1): {t_star:.3f}")  # Skip since using per-group
 
-    # Skip re-fitting since we already have optimal t_group from EG-outer
-    source_info = f'gse_{objective}_plugin'
-    extra_info = {"beta": beta_star.tolist()}
-    
-    # Set parameters from EG-outer results
-    alpha_star_tensor = alpha_star.to(DEVICE)
-    mu_star_tensor = mu_star.to(DEVICE)
-    
-    # Coverage targets for reference
-    target_cov_by_group = [0.55, 0.45] if num_groups==2 else [cov_target]*num_groups
-    
-    # Use per-group thresholds from EG-outer directly (ensuring consistency)
-    t_group_star = t_group_star.cpu().numpy().tolist()
-    # best_score already available from EG-outer result
-    source_info = "EG-outer per-group thresholds"
-    
-    print(f"✅ Using per-group thresholds from EG-outer: {t_group_star}")
+    # Use global threshold or per-group thresholds based on method
+    if objective == 'worst' and CONFIG['plugin_params']['use_eg_outer']:
+        # Use per-group thresholds from EG-outer directly (ensuring consistency)
+        t_group = t_group_star.cpu().numpy().tolist() if hasattr(t_group_star, 'cpu') else t_group_star
+        print(f"✅ Using per-group thresholds from EG-outer: {t_group}")
+        source_info = "EG-outer per-group thresholds"
+    else:
+        # Use global threshold from plugin
+        t_group = [t_star] * num_groups  # Convert single threshold to per-group format
+        print(f"✅ Using global threshold t*={t_star:.3f} for all groups")
+        source_info = f'gse_{objective}_plugin'
     
     # 7) Save results
     print("\n🎉 GSE-Balanced Plugin Complete!")
     print(f"α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
     print(f"μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
     print(f"Best {objective} error on S2 = {best_score:.4f}")
-    # print(f"Raw-margin threshold t* = {t_star:.3f}")  # Skip since using per-group thresholds
+    
+    # Define target coverage by group
+    target_cov_by_group = [0.55, 0.45] if num_groups == 2 else [cov_target] * num_groups
     
     # Save checkpoint with optimal parameters
     output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
@@ -806,9 +797,9 @@ def main():
         'mu': mu_star,
         'class_to_group': class_to_group,
         'num_groups': num_groups,
-        'threshold': t_group_star,  # Using the per-group thresholds from EG-outer
-        't_group': t_group_star,   # Per-group thresholds
-        'per_group_threshold': True,  # Flag to indicate per-group thresholds available
+        'threshold': t_group,  # Using the appropriate thresholds (per-group or global)
+        't_group': t_group,   # Per-group thresholds
+        'per_group_threshold': objective == 'worst' and CONFIG['plugin_params']['use_eg_outer'],  # Flag based on method
         'target_cov_by_group': target_cov_by_group,
         'best_score': best_score,
         'source': source_info,  # Method used to generate results
@@ -817,7 +808,11 @@ def main():
     }
     
     # Add extra information based on method used
-    checkpoint.update(extra_info)
+    if objective == 'worst' and CONFIG['plugin_params']['use_eg_outer']:
+        if 'beta_star' in locals():
+            checkpoint['beta'] = beta_star.tolist() if hasattr(beta_star, 'tolist') else beta_star
+        if 'eg_hist' in locals():
+            checkpoint['eg_history'] = eg_hist
     
     ckpt_path = output_dir / 'gse_balanced_plugin.ckpt'
     torch.save(checkpoint, ckpt_path)
