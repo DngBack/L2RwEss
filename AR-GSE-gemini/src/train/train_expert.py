@@ -24,6 +24,7 @@ EXPERT_CONFIGS = {
         'epochs': 256,
         'lr': 0.1,
         'weight_decay': 1e-4,
+        'dropout_rate': 0.1,  # No dropout for baseline
         'milestones': [96, 192, 224],  # For MultiStepLR
         'gamma': 0.1
     },
@@ -33,6 +34,7 @@ EXPERT_CONFIGS = {
         'epochs': 256,
         'lr': 0.1,
         'weight_decay': 5e-4,  # Slightly higher regularization for imbalanced data
+        'dropout_rate': 0.1,  # Light dropout for imbalanced data
         'milestones': [160,180],
         'gamma': 0.1
     },
@@ -42,6 +44,7 @@ EXPERT_CONFIGS = {
         'epochs': 256,
         'lr': 0.1,
         'weight_decay': 5e-4,
+        'dropout_rate': 0.1,  # Light dropout for imbalanced data
         'milestones': [96, 192, 224],
         'gamma': 0.1
     }
@@ -240,9 +243,19 @@ def train_single_expert(expert_key):
     train_loader, val_loader = get_dataloaders()
     
     # Model and loss
-    model = Expert(num_classes=CONFIG['dataset']['num_classes']).to(DEVICE)
+    model = Expert(
+        num_classes=CONFIG['dataset']['num_classes'],
+        backbone_name='cifar_resnet32',
+        dropout_rate=expert_config['dropout_rate'],
+        init_weights=True
+    ).to(DEVICE)
+    
     criterion = get_loss_function(loss_type, train_loader)
     print(f"✅ Loss Function: {type(criterion).__name__}")
+    
+    # Print model summary
+    print("📊 Model Architecture:")
+    model.summary()
     
     # Optimizer and scheduler
     optimizer = optim.SGD(

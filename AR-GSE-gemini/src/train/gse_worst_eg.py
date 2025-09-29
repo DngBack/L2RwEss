@@ -4,9 +4,6 @@ This implements the EG-outer algorithm for worst-group selective prediction.
 """
 import torch
 import numpy as np
-from src.train.gse_balanced_plugin import (
-    worst_error_on_S
-)
 
 @torch.no_grad()
 def compute_raw_margin_with_beta(eta, alpha, mu, beta, class_to_group):
