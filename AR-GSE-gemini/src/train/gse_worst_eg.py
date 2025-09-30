@@ -15,6 +15,65 @@ def compute_raw_margin_with_beta(eta, alpha, mu, beta, class_to_group):
     thr = (coeff.unsqueeze(0) * eta).sum(dim=1)
     return score - thr
 
+@torch.no_grad()
+def update_alpha_conditional_with_beta_tgroup(eta, y, alpha, mu, beta, t_group, class_to_group, K,
+                                               gamma=0.25, a_min=0.8, a_max=1.4):
+    """
+    Conditional alpha update for EG-outer with beta weighting and per-group thresholds.
+    Fits acceptance rate per GT-group using thresholds fitted on predicted groups.
+    
+    Args:
+        eta: mixture posteriors [N, C]
+        y: ground-truth labels [N]
+        alpha, mu, beta: per-group parameters [K]
+        t_group: per-group thresholds [K] fitted on predicted groups
+        class_to_group: class -> group mapping [C]
+        K: number of groups
+        gamma: EMA factor
+        a_min, a_max: alpha bounds
+        
+    Returns:
+        updated alpha [K]
+    """
+    device = eta.device
+    cg = class_to_group.to(device)
+    
+    # Compute raw margins with beta
+    raw = compute_raw_margin_with_beta(eta, alpha, mu, beta, cg)
+    
+    # Predictions with (α*β) weighting
+    alpha_per_class = (alpha * beta)[cg]  # [C]
+    yhat = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)  # [N]
+    
+    # Per-sample threshold by PREDICTED group (deployable rule)
+    pred_groups = cg[yhat]
+    t_samp = t_group[pred_groups]  # [N]
+    
+    # Acceptance mask
+    accepted = (raw >= t_samp)
+    
+    # Estimate conditional acceptance per GROUND-TRUTH group (training signal)
+    y_groups = cg[y]
+    alpha_hat = torch.zeros(K, device=device)
+    for k in range(K):
+        mask_k = (y_groups == k)
+        if mask_k.sum() > 0:
+            acc_rate = accepted[mask_k].float().mean()
+            alpha_hat[k] = acc_rate.clamp(min=1e-3, max=1.0)
+        else:
+            alpha_hat[k] = 1.0
+    
+    # EMA update
+    a_new = (1 - gamma) * alpha + gamma * alpha_hat
+    
+    # Project: clamp min, then geometric mean = 1, then clamp range
+    a_new = a_new.clamp_min(a_min)
+    log_a = a_new.log()
+    a_new = torch.exp(log_a - log_a.mean())
+    a_new = a_new.clamp(min=a_min, max=a_max)
+    
+    return a_new
+
 def accepted_pred_with_beta(eta, alpha, mu, beta, thr, class_to_group):
     """Accept samples and make predictions using beta-weighted margins."""
     raw = compute_raw_margin_with_beta(eta, alpha, mu, beta, class_to_group)
@@ -46,7 +105,7 @@ def inner_cost_sensitive_plugin_with_per_group_thresholds(eta_S1, y_S1, eta_S2, 
     """
     device = eta_S1.device
     alpha = torch.ones(K, device=device)
-    best = {"score": float("inf"), "lambda_idx": None}
+    best = {"score": float("inf"), "raw_err": float("inf"), "cov_pen": 0.0, "lambda_idx": None}
     mus = []
     lambda_grid = list(lambda_grid)  # Ensure it's mutable
     
@@ -73,41 +132,63 @@ def inner_cost_sensitive_plugin_with_per_group_thresholds(eta_S1, y_S1, eta_S2, 
             for _ in range(alpha_steps):
                 raw_S1 = compute_raw_margin_with_beta(eta_S1, a_cur, mu, beta, class_to_group)
                 
-                # Fit per-group thresholds on CORRECT predictions with ground-truth groups
-                preds_S1 = ((a_cur*beta)[class_to_group] * eta_S1).argmax(dim=1).cpu()
-                y_groups_S1 = class_to_group[y_S1.cpu()]          # Ground-truth groups
-                correct_mask = (preds_S1 == y_S1.cpu())          # Only correct predictions
+                # ✅ FIX: Fit per-group thresholds on ALL predictions (not correct-only)
+                # ✅ Use PREDICTED groups (deployable rule)
+                alpha_per_class = (a_cur * beta)[class_to_group]  # [C]
+                preds_S1 = (alpha_per_class.unsqueeze(0) * eta_S1).argmax(dim=1).cpu()  # [N]
+                pred_groups_S1 = class_to_group[preds_S1]  # [N] - groups by prediction
                 
-                if correct_mask.sum() > 0:
-                    t_group_cur = fit_group_thresholds_from_raw(
-                        raw_S1.cpu()[correct_mask],
-                        y_groups_S1[correct_mask], 
-                        target_cov_by_group,
-                        K=K
-                    )
-                    t_group_cur = torch.tensor(t_group_cur, device=device)
-                else:
-                    # Fallback if no correct predictions
-                    t_group_cur = torch.full((K,), -1.0, device=device)
+                # Fit thresholds by quantile on ALL samples grouped by predicted group
+                t_group_cur = []
+                for k in range(K):
+                    mk = (pred_groups_S1 == k)
+                    if mk.sum() == 0:
+                        # No predictions in group k -> use min margin as fallback
+                        t_group_cur.append(float(raw_S1.min().cpu()))
+                    else:
+                        # Quantile for target coverage: Q_{1-τ_k}(m_raw | pred_group=k)
+                        q = 1.0 - (target_cov_by_group[k] if K == 2 else np.mean(target_cov_by_group))
+                        t_k = float(torch.quantile(raw_S1[mk].cpu(), q))
+                        t_group_cur.append(t_k)
                 
-                # Simple alpha update for per-group thresholds - placeholder
-                # We use the existing blended approach adapted for per-group thresholds
-                a_cur = 0.9 * a_cur + 0.1 * torch.ones(K, device=device)
+                t_group_cur = torch.tensor(t_group_cur, device=device)
                 
-                # Use blended alpha update with per-group thresholds
-                if use_conditional_alpha:
-                    # For now, skip complex conditional update
-                    pass
-                else:
-                    # Simple EMA update
-                    pass
+                # ✅ Alpha update using per-group thresholds with beta weighting
+                a_cur = update_alpha_conditional_with_beta_tgroup(
+                    eta_S1, y_S1, a_cur, mu, beta, t_group_cur, class_to_group, K,
+                    gamma=gamma, a_min=0.8, a_max=1.4
+                )
 
             # Evaluate on S2 using same per-group thresholds
             from src.train.gse_balanced_plugin import worst_error_on_S_with_per_group_thresholds
             w_err, gerrs = worst_error_on_S_with_per_group_thresholds(eta_S2, y_S2, a_cur, mu, t_group_cur, class_to_group, K)
             
-            if w_err < best["score"]:
-                best.update(dict(score=w_err, alpha=a_cur.clone(), mu=mu.clone(), t_group=t_group_cur.clone()))
+            # ✅ Add coverage penalty to prevent threshold being too tight
+            # Compute coverage by predicted groups on S2
+            raw_S2 = compute_raw_margin_with_beta(eta_S2, a_cur, mu, beta, class_to_group)
+            alpha_per_class_S2 = (a_cur * beta)[class_to_group]
+            yhat_S2 = (alpha_per_class_S2.unsqueeze(0) * eta_S2).argmax(dim=1)
+            pred_groups_S2 = class_to_group[yhat_S2]
+            
+            # Per-group coverage (by predicted groups)
+            cov_by_pred_group = []
+            for k in range(K):
+                mk = (pred_groups_S2 == k)
+                if mk.sum() > 0:
+                    cov_k = (raw_S2[mk] >= t_group_cur[k]).float().mean().item()
+                    cov_by_pred_group.append(cov_k)
+                else:
+                    cov_by_pred_group.append(0.0)
+            
+            # Coverage penalty: penalize deviation from target coverage
+            cov_penalty = sum((cov_by_pred_group[k] - target_cov_by_group[k])**2 for k in range(K))
+            
+            # Combined objective: worst-error + coverage penalty
+            score = w_err + 5.0 * cov_penalty  # weight 5.0 for moderate penalty
+            
+            if score < best["score"]:
+                best.update(dict(score=score, raw_err=w_err, cov_pen=cov_penalty, 
+                                alpha=a_cur.clone(), mu=mu.clone(), t_group=t_group_cur.clone()))
                 best_lambda_idx = i
                 
         # Adaptive lambda grid expansion when best hits boundary
@@ -129,6 +210,9 @@ def inner_cost_sensitive_plugin_with_per_group_thresholds(eta_S1, y_S1, eta_S2, 
             print(f"↔️ Expanded lambda_grid to [{lambda_grid[0]:.2f}, {lambda_grid[-1]:.2f}] ({len(lambda_grid)} pts)")
                 
         alpha = 0.5*alpha + 0.5*best["alpha"]
+    
+    # Print final best with coverage info
+    print(f"\n✅ Best inner solution: score={best['score']:.4f} (raw_err={best['raw_err']:.4f}, cov_pen={best['cov_pen']:.4f})")
     
     return best["alpha"], best["mu"], best["t_group"], best["score"]
 
@@ -168,13 +252,17 @@ def worst_group_eg_outer(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     print(f"Lambda grid: [{lambda_grid[0]:.2f}, {lambda_grid[-1]:.2f}] ({len(lambda_grid)} points)")
 
     for t in range(T):
-        print(f"EG iteration {t+1}/{T}, β={[f'{b:.4f}' for b in beta.detach().cpu().tolist()]}")
+        print(f"\nEG iteration {t+1}/{T}, β={[f'{b:.4f}' for b in beta.detach().cpu().tolist()]}")
         
         # Inner optimization with current beta - use per-group version
         a_t, m_t, thr_group_t, _ = inner_cost_sensitive_plugin_with_per_group_thresholds(
             eta_S1, y_S1, eta_S2, y_S2, class_to_group, K, beta,
             lambda_grid=lambda_grid, **inner_kwargs
         )
+        
+        # Print alpha evolution (tracking whether it moves)
+        print(f"   α_t = {[f'{a:.4f}' for a in a_t.cpu().tolist()]}, μ_t = {[f'{m:.4f}' for m in m_t.cpu().tolist()]}")
+        print(f"   t_group = {[f'{tk:.4f}' for tk in thr_group_t.cpu().tolist()]}")
         
         # Compute per-group errors on S2 using per-group thresholds
         from src.train.gse_balanced_plugin import worst_error_on_S_with_per_group_thresholds

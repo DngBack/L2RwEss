@@ -154,6 +154,22 @@ def compute_frequency_weights(labels, class_counts, smoothing=0.5):
     freq_weights = freq_weights / freq_weights.mean()
     return freq_weights
 
+# ---------------------------- Robust Logits Loading Helpers ---------------------------- #
+
+def _load_logits_tensor(path):
+    """Load logits from file, handling both dict and tensor formats."""
+    obj = torch.load(path, map_location='cpu')
+    if isinstance(obj, dict) and 'logits' in obj:
+        return obj['logits'].float()
+    return obj.float()
+
+def _load_labels_from_file_or_base(obj, base_ds, indices):
+    """Load labels from dict or fallback to base dataset."""
+    if isinstance(obj, dict) and 'labels' in obj:
+        return obj['labels'].long()
+    # fallback: extract from base dataset
+    return torch.tensor(np.array(base_ds.targets)[indices], dtype=torch.long)
+
 def load_data_from_logits(config):
     """Load pre-computed logits for training gating."""
     logits_root = Path(config['experts']['logits_dir']) / config['dataset']['name']
@@ -167,13 +183,16 @@ def load_data_from_logits(config):
     indices_path = splits_dir / 'tuneV_indices.json'
     indices = json.loads(indices_path.read_text())
 
-    # Stack expert logits
+    # Stack expert logits (robust loading)
     stacked_logits = torch.zeros(len(indices), num_experts, num_classes)
     for i, expert_name in enumerate(expert_names):
         logits_path = logits_root / expert_name / "tuneV_logits.pt"
-        stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
+        stacked_logits[:, i, :] = _load_logits_tensor(logits_path)
 
-    labels = torch.tensor(np.array(cifar_train_full.targets)[indices])
+    # Load labels (robust: from dict or base dataset)
+    labels_obj = torch.load(logits_root / expert_names[0] / "tuneV_logits.pt", map_location='cpu')
+    labels = _load_labels_from_file_or_base(labels_obj, cifar_train_full, indices)
+    
     dataset = TensorDataset(stacked_logits, labels)
     
     return DataLoader(dataset, batch_size=config['gating_params']['batch_size'], 
@@ -182,7 +201,7 @@ def load_data_from_logits(config):
 # ---------------------------- Selective Mode Utilities ---------------------------- #
 
 def load_two_splits_from_logits(config):
-    """Load tuneV (S1) and val_lt (S2) splits with stacked expert logits."""
+    """Load tuneV (S1) and val_lt (S2) splits with stacked expert logits (robust loading)."""
     logits_root = Path(config['experts']['logits_dir']) / config['dataset']['name']
     splits_dir = Path(config['dataset']['splits_dir'])
     expert_names = config['experts']['names']
@@ -204,12 +223,18 @@ def load_two_splits_from_logits(config):
             raise FileNotFoundError(f"Missing indices file: {idx_path}")
         indices = json.loads(idx_path.read_text())
         stacked = torch.zeros(len(indices), num_experts, num_classes)
+        
+        # Robust loading: handle both dict and tensor formats
         for i, ename in enumerate(expert_names):
             logit_path = logits_root / ename / f"{split_name}_logits.pt"
             if not logit_path.exists():
                 raise FileNotFoundError(f"Missing logits file: {logit_path}")
-            stacked[:, i, :] = torch.load(logit_path, map_location='cpu')
-        labels = torch.tensor(np.array(base_ds.targets)[indices])
+            stacked[:, i, :] = _load_logits_tensor(logit_path)
+        
+        # Robust labels: try dict format first, fallback to base dataset
+        obj0 = torch.load(logits_root / expert_names[0] / f"{split_name}_logits.pt", map_location='cpu')
+        labels = _load_labels_from_file_or_base(obj0, base_ds, indices)
+        
         dataset = TensorDataset(stacked, labels)
         out[split_name] = DataLoader(dataset, batch_size=CONFIG['gating_params']['batch_size'], shuffle=True if split_name=='tuneV' else False, num_workers=4)
     return out['tuneV'], out['val_lt']
@@ -284,8 +309,6 @@ def fit_temperature_scaling(expert_logits, labels, expert_names, device='cuda'):
 
 def compute_mixture_and_w(model, expert_logits):
     """Return gating weights w [B,E] and mixture posterior η [B,C]."""
-    with torch.no_grad():
-        pass
     gating_features = model.feature_builder(expert_logits)
     w = torch.softmax(model.gating_net(gating_features), dim=1)  # [B,E]
     expert_probs = torch.softmax(expert_logits, dim=-1)          # [B,E,C]
@@ -304,26 +327,41 @@ def compute_raw_margin(eta, alpha, mu, class_to_group):
     threshold_term = (coeff.unsqueeze(0) * eta).sum(dim=1)
     return score - threshold_term  # [B]
 
-def update_alpha_fixed_point_conditional(eta, y, alpha, mu, t, class_to_group, K, gamma=0.2, alpha_min=0.85, alpha_max=1.15, rho=0.03):
-    """Conditional acceptance fixed-point for α (reuse simplified logic)."""
+def update_alpha_fixed_point_conditional(eta, y, alpha, mu, t_param, class_to_group, K, gamma=0.2, alpha_min=0.85, alpha_max=1.15, rho=0.03):
+    """Conditional acceptance fixed-point for α using per-group thresholds t_param."""
     device = eta.device
     with torch.no_grad():
+        # Compute raw margin
         raw = compute_raw_margin(eta, alpha, mu, class_to_group)
-        accepted = raw > t
+        
+        # Prediction with α: ŷ = argmax_y α_{g(y)} * η_y
+        alpha_per_class = alpha[class_to_group].to(device)  # [C]
+        yhat = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)  # [B]
+        
+        # Get per-sample threshold based on predicted class group
+        t_samp = t_param[class_to_group[yhat].to(device)]  # [B]
+        
+        # Hard acceptance: raw > threshold
+        accepted = raw > t_samp
+        
+        # Compute acceptance rate per ground-truth group
         y_groups = class_to_group[y].to(device)
         alpha_hat = torch.ones_like(alpha)
         for k in range(K):
             mask = (y_groups == k)
             if mask.any():
                 grp_acc = (accepted & mask).float().sum() / mask.float().sum()
-                alpha_hat[k] = grp_acc + 1e-3
-        # EMA
+                alpha_hat[k] = grp_acc.clamp_min(1e-3)
+        
+        # EMA update
         new_alpha = (1 - gamma) * alpha + gamma * alpha_hat
+        
         # Project: enforce geomean=1 then clamp
         new_alpha = new_alpha.clamp_min(alpha_min)
         loga = new_alpha.log()
         new_alpha = torch.exp(loga - loga.mean())
         new_alpha = new_alpha.clamp(min=alpha_min, max=alpha_max)
+    
     # Add directional prior u=[-1,+1] for K=2 to gently push tail up
     if K == 2 and rho > 0:
         u = torch.tensor([-1.0, 1.0], device=new_alpha.device)
@@ -350,38 +388,42 @@ def mu_from_lambda_grid(lambdas, K):
     return mus
 
 def evaluate_split_with_learned_thresholds(eta, y, alpha, mu, t_param, class_to_group, K, objective='worst_err'):
-    """Evaluate split using learned per-group thresholds t_param instead of fitting."""
+    """Evaluate split using learned per-group thresholds with correct prediction and acceptance law."""
     with torch.no_grad():
+        # Compute raw margin
         m_raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+        
+        # Prediction with α: ŷ = argmax_y α_{g(y)} * η_y (consistent with paper)
+        alpha_per_class = alpha[class_to_group]  # [C]
+        yhat = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)  # [B]
+        
+        # Get per-sample threshold based on PREDICTED class group (ŷ)
+        t_for_pred = t_param[class_to_group[yhat]]  # [B]
+        
+        # Hard acceptance: m_raw > threshold (consistent with test-time law)
+        accepted = m_raw > t_for_pred
+        
+        if not accepted.any():
+            return 1.0, [1.0]*K
+        
+        # Group-wise errors based on ground-truth groups
         y_groups = class_to_group[y]
-        t_groups = t_param[y_groups]  # Select threshold for each sample's group
-        s = torch.sigmoid(10.0 * (m_raw - t_groups))  # Use fixed kappa=10.0
-        
-        pred = eta.argmax(dim=1)
-        correct = (pred == y).float()
-        
-        # Group-wise errors
-        group_errs = []
-        for g in range(K):
-            mask = (y_groups == g)
-            if mask.sum() > 0:
-                s_g = s[mask]
-                correct_g = correct[mask]
-                # Rejection is (1 - s), so accepted error is: wrong predictions with high s
-                accepted_wrong = (1 - correct_g) * s_g
-                total_accepted = s_g.sum().clamp(min=1e-6)
-                err_g = accepted_wrong.sum() / total_accepted
-                group_errs.append(err_g.item())
+        errs = []
+        for k in range(K):
+            mask = (y_groups == k) & accepted
+            if mask.any():
+                acc = (yhat[mask] == y[mask]).float().mean().item()
+                errs.append(1.0 - acc)
             else:
-                group_errs.append(0.0)
+                errs.append(1.0)
         
         # Objective computation
-        if objective == 'worst_err':
-            return max(group_errs), group_errs
-        elif objective == 'balanced_err':
-            return sum(group_errs) / K, group_errs
+        if objective == 'worst_err' or objective == 'worst':
+            return max(errs), errs
+        elif objective == 'balanced_err' or objective == 'balanced':
+            return float(np.mean(errs)), errs
         else:
-            return group_errs[0], group_errs  # Default to first group
+            return errs[0], errs  # Default to first group
 
 def evaluate_split(eta, y, alpha, mu, t, class_to_group, K, objective='worst'):
     """Compute error on accepted samples under objective."""
@@ -737,10 +779,10 @@ def run_selective_mode():
         eta_S1, y_S1 = cache_eta(S1_loader)
         eta_S2, y_S2 = cache_eta(S2_loader)
 
-        # B2: update α (optional)
+        # B2: update α (optional) - now using per-group thresholds t_param
         if sel_cfg['update_alpha']:
             for _ in range(sel_cfg['alpha_steps']):
-                alpha = update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, t, class_to_group.to(DEVICE), K,
+                alpha = update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, t_param, class_to_group.to(DEVICE), K,
                                                              gamma=sel_cfg['gamma_alpha'], alpha_min=sel_cfg['alpha_min'], alpha_max=sel_cfg['alpha_max'], rho=0.03)
             print(f"  Updated α: {alpha.tolist()}")
 

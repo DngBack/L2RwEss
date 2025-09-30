@@ -22,6 +22,30 @@ from src.train.gse_balanced_plugin import compute_margin
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# --- HELPER FUNCTIONS ---
+
+def apply_per_expert_temperature(logits, expert_names, temp_dict):
+    """
+    Apply per-expert temperature scaling to logits.
+    
+    Args:
+        logits: [B, E, C] expert logits
+        expert_names: list of expert names
+        temp_dict: dict mapping expert name -> temperature
+        
+    Returns:
+        scaled_logits: [B, E, C] temperature-scaled logits
+    """
+    if not temp_dict:
+        return logits
+    
+    scaled = logits.clone()
+    for i, name in enumerate(expert_names):
+        T = float(temp_dict.get(name, 1.0))
+        if abs(T - 1.0) > 1e-6:
+            scaled[:, i, :] = scaled[:, i, :] / T
+    return scaled
+
 CONFIG = {
     'dataset': {
         'name': 'cifar100_lt_if100',
@@ -39,8 +63,8 @@ CONFIG = {
         'coverage_points': [0.7, 0.8, 0.9],
         'bootstrap_n': 1000,
     },
-    'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
-    'output_dir': './results_worst_eg_improved/cifar100_lt_if100',
+    'plugin_checkpoint': './checkpoints/argse_worst_eg_improved_v2/cifar100_lt_if100/gse_balanced_plugin.ckpt',
+    'output_dir': './results_worst_eg_improved_v2/cifar100_lt_if100',
     'seed': 42
 }
 
@@ -69,13 +93,42 @@ def load_test_data():
     
     return stacked_logits, test_labels
 
-def get_mixture_posteriors(model, logits):
-    """Get mixture posteriors η̃(x) from expert logits."""
+def load_val_data():
+    """Load validation (val_lt) logits and labels for threshold recalibration."""
+    logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
+    splits_dir = Path(CONFIG['dataset']['splits_dir'])
+    
+    with open(splits_dir / 'val_lt_indices.json', 'r') as f:
+        val_indices = json.load(f)
+    num_val_samples = len(val_indices)
+    
+    # Load expert logits for val set
+    num_experts = len(CONFIG['experts']['names'])
+    stacked_logits = torch.zeros(num_val_samples, num_experts, CONFIG['dataset']['num_classes'])
+    
+    for i, expert_name in enumerate(CONFIG['experts']['names']):
+        logits_path = logits_root / expert_name / "val_lt_logits.pt"
+        if not logits_path.exists():
+            raise FileNotFoundError(f"Logits file not found: {logits_path}")
+        stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
+    
+    # Load val labels
+    full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+    val_labels = torch.tensor(np.array(full_test_dataset.targets)[val_indices])
+    
+    return stacked_logits, val_labels
+
+def get_mixture_posteriors(model, logits, expert_names=None, temperatures=None):
+    """Get mixture posteriors η̃(x) from expert logits with optional temperature scaling."""
     model.eval()
     with torch.no_grad():
         logits = logits.to(DEVICE)
         
-        # Get expert posteriors
+        # Apply per-expert temperature scaling if provided
+        if expert_names is not None and temperatures is not None:
+            logits = apply_per_expert_temperature(logits, expert_names, temperatures)
+        
+        # Get expert posteriors (with temperature-scaled logits)
         expert_posteriors = torch.softmax(logits, dim=-1)  # [B, E, C]
         
         # Get gating weights
@@ -90,15 +143,30 @@ def get_mixture_posteriors(model, logits):
 def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, threshold, class_to_group, K):
     """
     Analyze detailed per-group performance metrics.
+    Uses per-sample thresholds based on PREDICTED groups for accurate overlap analysis.
     """
     print("\n" + "="*50)
-    print("DETAILED GROUP-WISE ANALYSIS")
+    print("DETAILED GROUP-WISE ANALYSIS (by Ground-Truth Groups)")
     print("="*50)
     
     # Ensure all tensors are on same device
     device = eta_mix.device
     class_to_group = class_to_group.to(device)
     y_groups = class_to_group[labels]
+    
+    # Compute per-sample thresholds based on PREDICTED groups (for overlap analysis)
+    alpha_per_class = alpha[class_to_group].to(device)
+    yhat = (alpha_per_class.unsqueeze(0) * eta_mix).argmax(dim=1)
+    pred_groups = class_to_group[yhat]
+    
+    # Convert threshold to tensor
+    if isinstance(threshold, (list, torch.Tensor)):
+        t_group_tensor = torch.tensor(threshold, device=device) if isinstance(threshold, list) else threshold.to(device)
+    else:
+        # Single threshold -> replicate for all groups
+        t_group_tensor = torch.full((K,), float(threshold), device=device)
+    
+    thr_per_sample = t_group_tensor[pred_groups]  # Per-sample threshold by predicted group
     
     for k in range(K):
         group_name = "Head" if k == 0 else "Tail"
@@ -108,7 +176,7 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         if group_size == 0:
             continue
             
-        # Coverage and error for this group
+        # Coverage and error for this GT group
         group_accepted = accepted[group_mask]
         group_coverage = group_accepted.float().mean().item()
         
@@ -133,14 +201,14 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         else:
             group_error = 1.0
             
-        # Raw margin statistics for this group
+        # Raw margin statistics for this GT group
         raw_margins = compute_margin(eta_mix[group_mask], alpha, mu, 0.0, class_to_group)
         margin_mean = raw_margins.mean().item()
         margin_std = raw_margins.std().item()
         margin_min = raw_margins.min().item()
         margin_max = raw_margins.max().item()
         
-        print(f"\n{group_name} Group (k={k}):")
+        print(f"\n{group_name} Group (k={k}, by ground-truth):")
         print(f"  • Size: {group_size} samples")
         print(f"  • Coverage: {group_coverage:.3f}")
         print(f"  • Error: {group_error:.3f}")
@@ -149,24 +217,141 @@ def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, thres
         print(f"  • α_k: {alpha[k]:.3f}")
         print(f"  • μ_k: {mu[k]:.3f}")
         # Show the threshold for this group
-        group_threshold_val = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
-        print(f"  • τ_k: {group_threshold_val:.3f}")
+        group_threshold_val = t_group_tensor[k].item()
+        print(f"  • τ_k (from config): {group_threshold_val:.3f}")
         print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
         
-        # Check separation quality
-        accepted_margins = raw_margins[group_accepted]
-        rejected_margins = raw_margins[~group_accepted]
+        # Check separation quality using per-sample thresholds (by predicted group)
+        group_accepted_margins = raw_margins[group_accepted]
+        group_rejected_margins = raw_margins[~group_accepted]
+        group_thr_accepted = thr_per_sample[group_mask][group_accepted]
+        group_thr_rejected = thr_per_sample[group_mask][~group_accepted]
         
-        if len(accepted_margins) > 0 and len(rejected_margins) > 0:
-            separation = accepted_margins.min().item() - rejected_margins.max().item()
-            # Use the appropriate threshold for this group
-            group_threshold = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
-            overlap_ratio = (rejected_margins > group_threshold).sum().item() / len(rejected_margins)
+        if len(group_accepted_margins) > 0 and len(group_rejected_margins) > 0:
+            separation = group_accepted_margins.min().item() - group_rejected_margins.max().item()
+            # Overlap: rejected samples with margin > their per-sample threshold
+            overlap_ratio = (group_rejected_margins > group_thr_rejected).float().mean().item()
             print(f"  • Margin separation: {separation:.3f}")
-            print(f"  • Overlap ratio: {overlap_ratio:.3f}")
+            print(f"  • Overlap ratio (w.r.t per-sample t by pred-group): {overlap_ratio:.3f}")
+    
+    # Additional: Breakdown by PREDICTED groups
+    print("\n" + "="*50)
+    print("BREAKDOWN BY PREDICTED GROUPS")
+    print("="*50)
+    for k in range(K):
+        pred_mask = (pred_groups == k)
+        if pred_mask.sum() == 0:
+            continue
+        pred_cov = accepted[pred_mask].float().mean().item()
+        pred_name = "Head" if k == 0 else "Tail"
+        print(f"{pred_name} predictions (k={k}): {pred_mask.sum().item()} samples, coverage={pred_cov:.3f}, threshold={t_group_tensor[k].item():.3f}")
     
     print("\n" + "="*50)
 
+def recalibrate_thresholds_on_val(logits_val, labels_val, model, alpha, mu, class_to_group, 
+                                   tau_by_group, expert_names, temperatures, checkpoint):
+    """
+    Post-hoc recalibrate per-group thresholds on validation set (val_lt).
+    Fits t_k on ALL predictions (not just correct ones) to achieve target coverage by predicted group.
+    
+    This is the deployable approach: thresholds based on predicted groups, not ground-truth groups.
+    
+    Args:
+        logits_val: validation expert logits [N, E, C]
+        labels_val: validation labels [N] (used only for analysis, not for threshold fitting)
+        model: AR_GSE model with trained gating
+        alpha, mu: optimal parameters from plugin
+        class_to_group: class -> group mapping
+        tau_by_group: target coverage per group [τ_head, τ_tail]
+        expert_names: list of expert names
+        temperatures: per-expert temperature dict
+        checkpoint: full checkpoint dict (for gating weights)
+        
+    Returns:
+        t_recalibrated: list of per-group thresholds [K]
+    """
+    print("\n" + "="*50)
+    print("POST-HOC THRESHOLD RECALIBRATION ON VAL_LT")
+    print("="*50)
+    
+    device = DEVICE
+    K = int(class_to_group.max().item() + 1)
+    
+    # 1) Apply temperature scaling
+    logits_val_scaled = apply_per_expert_temperature(logits_val, expert_names, temperatures)
+    
+    # 2) Get mixture posteriors
+    model.eval()
+    with torch.no_grad():
+        logits_val_scaled = logits_val_scaled.to(device)
+        expert_posteriors = torch.softmax(logits_val_scaled, dim=-1)  # [N, E, C]
+        
+        # Get gating weights
+        gating_features = model.feature_builder(logits_val_scaled)
+        w = torch.softmax(model.gating_net(gating_features), dim=1)  # [N, E]
+        
+        # Mixture posteriors
+        eta_val = torch.einsum('be,bec->bc', w, expert_posteriors).cpu()  # [N, C]
+    
+    # 3) Compute raw margins and predictions with α-reweighting
+    alpha_cpu = alpha.cpu()
+    mu_cpu = mu.cpu()
+    cg_cpu = class_to_group.cpu()
+    
+    from src.train.gse_balanced_plugin import compute_margin
+    margins_val = compute_margin(eta_val, alpha_cpu, mu_cpu, 0.0, cg_cpu)  # [N]
+    
+    # Prediction with α
+    alpha_per_class = alpha_cpu[cg_cpu]  # [C]
+    yhat_val = (alpha_per_class.unsqueeze(0) * eta_val).argmax(dim=1)  # [N]
+    pred_groups_val = cg_cpu[yhat_val]  # [N] - groups of predicted classes
+    
+    # 4) Fit per-group thresholds on ALL predictions (not just correct ones)
+    # This is deployable: we don't filter by correctness at test-time
+    tau_head, tau_tail = tau_by_group if len(tau_by_group) == 2 else (0.56, 0.44)
+    quantile_targets = [1 - tau_head, 1 - tau_tail] if K == 2 else [1 - np.mean(tau_by_group)] * K
+    
+    t_recalibrated = []
+    print(f"\nTarget coverage: head={tau_head:.2f}, tail={tau_tail:.2f}")
+    print("Fitting thresholds on val_lt by PREDICTED groups (deployable):\n")
+    
+    for k in range(K):
+        pred_mask = (pred_groups_val == k)
+        group_name = "head" if k == 0 else "tail"
+        
+        if pred_mask.sum() == 0:
+            # No predictions in this group - use min margin as fallback
+            t_k = float(margins_val.min())
+            print(f"  ⚠️  {group_name} (k={k}): No predictions, using t_k={t_k:.3f}")
+        else:
+            # Compute quantile on margins of samples predicted as group k
+            t_k = float(torch.quantile(margins_val[pred_mask], quantile_targets[k]))
+            
+            # Verify achieved coverage
+            accepted_k = margins_val[pred_mask] >= t_k
+            achieved_cov = accepted_k.float().mean().item()
+            
+            print(f"  ✅ {group_name} (k={k}): {pred_mask.sum().item()} predictions, "
+                  f"t_k={t_k:.3f}, achieved coverage={achieved_cov:.3f} (target={tau_by_group[k]:.2f})")
+        
+        t_recalibrated.append(t_k)
+    
+    # 5) Diagnostic: Show coverage by ground-truth groups (for comparison)
+    print("\n  Diagnostic - Coverage by ground-truth groups:")
+    y_groups_val = cg_cpu[labels_val]
+    for k in range(K):
+        gt_mask = (y_groups_val == k)
+        if gt_mask.sum() > 0:
+            # Use per-sample thresholds based on predicted groups
+            t_per_sample = torch.tensor([t_recalibrated[pred_groups_val[i].item()] 
+                                        for i in range(len(pred_groups_val))])
+            gt_accepted = margins_val[gt_mask] >= t_per_sample[gt_mask]
+            gt_cov = gt_accepted.float().mean().item()
+            group_name = "head" if k == 0 else "tail"
+            print(f"    {group_name} GT (k={k}): {gt_mask.sum().item()} samples, coverage={gt_cov:.3f}")
+    
+    print("="*50)
+    return t_recalibrated
 
 def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_group, K, kind="balanced"):
     """
@@ -292,57 +477,102 @@ def main():
     
     print("✅ Model configured with optimal parameters")
     
-    # 3. Load test data
-    print("📊 Loading test data...")
+    # 3. Load validation data for threshold recalibration
+    print("\n📊 Loading validation data for threshold recalibration...")
+    try:
+        val_logits, val_labels = load_val_data()
+        print(f"✅ Loaded {len(val_labels)} val_lt samples")
+        
+        # Recalibrate thresholds on val_lt (post-hoc, no retraining)
+        target_cov_by_group = checkpoint.get('target_cov_by_group', [0.56, 0.44])
+        t_recalibrated = recalibrate_thresholds_on_val(
+            val_logits, val_labels, model, alpha_star, mu_star, class_to_group,
+            tau_by_group=target_cov_by_group,
+            expert_names=CONFIG['experts']['names'],
+            temperatures=checkpoint.get('temperatures', None),
+            checkpoint=checkpoint
+        )
+        print(f"✅ Recalibrated thresholds: {[f'{t:.3f}' for t in t_recalibrated]}")
+        use_recalibrated = True
+    except FileNotFoundError as e:
+        print(f"⚠️  Could not load val_lt data: {e}")
+        print("   Falling back to checkpoint thresholds")
+        t_recalibrated = None
+        use_recalibrated = False
+    
+    # 4. Load test data
+    print("\n📊 Loading test data...")
     test_logits, test_labels = load_test_data()
     num_test_samples = len(test_labels)
     print(f"✅ Loaded {num_test_samples} test samples")
     
-    # 4. Get test predictions
+    # Load temperatures if available
+    temperatures = checkpoint.get('temperatures', None)
+    if temperatures:
+        print(f"🌡️  Per-expert temperatures: {temperatures}")
+    
+    # 5. Get test predictions with temperature scaling
     print("🔮 Computing test predictions...")
-    eta_mix = get_mixture_posteriors(model, test_logits)
+    eta_mix = get_mixture_posteriors(model, test_logits, 
+                                      expert_names=CONFIG['experts']['names'],
+                                      temperatures=temperatures)
     
     # Ensure all tensors are on CPU for consistent computation
     alpha_star_cpu = alpha_star.cpu()
     mu_star_cpu = mu_star.cpu()
     class_to_group_cpu = class_to_group.cpu()
     
-    # Compute raw margins and predictions
+    # Compute raw margins and predictions with α-reweighting
     margins_raw = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
-    preds = (alpha_star_cpu[class_to_group_cpu] * eta_mix).argmax(dim=1)
+    alpha_per_class = alpha_star_cpu[class_to_group_cpu]  # [C]
+    preds = (alpha_per_class.unsqueeze(0) * eta_mix).argmax(dim=1)  # [N] - α-reweighted prediction
     
-    # 🔧 FIXED: Use per-group thresholds with GROUND-TRUTH groups (not predicted groups)
-    t_group = checkpoint.get('t_group', None)
-    if t_group is not None:
-        # Convert to tensor if it's a list and keep original list for display
-        if isinstance(t_group, list):
-            t_group_list = t_group
-            t_group = torch.tensor(t_group)
-        else:
-            t_group_list = t_group.tolist()
-        
-        # Use GROUND-TRUTH groups (class_to_group[true_labels]) instead of prediction groups  
-        y_groups = class_to_group_cpu[test_labels]  # Ground-truth groups
-        
-        # Per-sample threshold based on ground-truth group
-        thresholds_per_sample = torch.tensor([t_group[g].item() for g in y_groups])
-        accepted = margins_raw >= thresholds_per_sample
-        
-        print(f"✅ Using per-group thresholds with GROUND-TRUTH groups: {t_group_list}")
-        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
-        
-        # Per-group coverage breakdown
-        for k in range(len(t_group_list)):
-            group_mask = (y_groups == k)
-            if group_mask.sum() > 0:
-                group_cov = accepted[group_mask].float().mean().item()
-                group_name = "head" if k == 0 else "tail" 
-                print(f"   📊 {group_name} (group {k}): coverage={group_cov:.3f}, threshold={t_group_list[k]:.3f}")
-            
+    # ✅ CORRECT: Use per-group thresholds with PREDICTED groups (deployable rule)
+    # Priority: use recalibrated thresholds if available, else use checkpoint thresholds
+    if use_recalibrated and t_recalibrated is not None:
+        t_group_list = t_recalibrated
+        t_group_tensor = torch.tensor(t_recalibrated, dtype=margins_raw.dtype)
+        threshold_source = "recalibrated on val_lt"
     else:
-        accepted = margins_raw >= plugin_threshold
-        print(f"✅ Using global threshold: {plugin_threshold:.3f}")
-        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+        t_group = checkpoint.get('t_group', None)
+        if t_group is not None:
+            # Convert to tensor if it's a list
+            t_group_tensor = torch.tensor(t_group, dtype=margins_raw.dtype) if isinstance(t_group, list) else t_group.cpu()
+            t_group_list = t_group if isinstance(t_group, list) else t_group.tolist()
+            threshold_source = "from checkpoint"
+        else:
+            # Fallback to global threshold
+            plugin_threshold = checkpoint.get('threshold', checkpoint.get('c', 0.0))
+            t_group_tensor = torch.tensor([plugin_threshold, plugin_threshold], dtype=margins_raw.dtype)
+            t_group_list = [plugin_threshold, plugin_threshold]
+            threshold_source = "global (fallback)"
+    
+    # Per-sample threshold based on PREDICTED group (test-time deployable!)
+    pred_groups = class_to_group_cpu[preds]  # Group of predicted class
+    thresholds_per_sample = t_group_tensor[pred_groups]  # [N]
+    accepted = margins_raw >= thresholds_per_sample
+    
+    print(f"\n✅ Using per-group thresholds by PREDICTED group ({threshold_source}):")
+    print(f"   {[f'{t:.3f}' for t in t_group_list]}")
+    print(f"✅ Test coverage: {accepted.float().mean():.3f}")
+    
+    # Per-group coverage breakdown by PREDICTED groups
+    for k in range(len(t_group_tensor)):
+        pred_mask = (pred_groups == k)
+        if pred_mask.sum() > 0:
+            pred_cov = accepted[pred_mask].float().mean().item()
+            group_name = "head" if k == 0 else "tail" 
+            print(f"   📊 {group_name} predictions (group {k}): {pred_mask.sum().item()} samples, coverage={pred_cov:.3f}, threshold={t_group_list[k]:.3f}")
+    
+    # Also show GT-group breakdown for comparison
+    y_groups = class_to_group_cpu[test_labels]
+    print(f"\n   Comparison - Coverage by ground-truth groups:")
+    for k in range(len(t_group_tensor)):
+        gt_mask = (y_groups == k)
+        if gt_mask.sum() > 0:
+            gt_cov = accepted[gt_mask].float().mean().item()
+            group_name = "head" if k == 0 else "tail"
+            print(f"   📊 {group_name} GT (group {k}): {gt_mask.sum().item()} samples, coverage={gt_cov:.3f}")
     
     # 5. Calculate metrics
     print("📈 Calculating metrics...")

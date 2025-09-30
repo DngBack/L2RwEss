@@ -272,7 +272,7 @@ def train_single_expert(expert_key):
     )
     
     # Training setup
-    best_acc = 0.0
+    best_tail_acc = 0.0  # Changed: Focus on tail accuracy instead of overall
     checkpoint_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = checkpoint_dir / f"best_{expert_name}.pth"
@@ -303,10 +303,10 @@ def train_single_expert(expert_key):
             f"Val Acc={val_acc:.2f}%, Head={group_accs['head']:.1f}%, "
             f"Tail={group_accs['tail']:.1f}%, LR={scheduler.get_last_lr()[0]:.5f}")
         
-        # Save best model
-        if val_acc > best_acc:
-            best_acc = val_acc
-            print(f"💾 New best! Saving to {best_model_path}")
+        # Save best model based on tail accuracy
+        if group_accs['tail'] > best_tail_acc:
+            best_tail_acc = group_accs['tail']
+            print(f"💾 New best tail acc ({best_tail_acc:.2f}%)! Saving to {best_model_path}")
             torch.save(model.state_dict(), best_model_path)
     
     # Post-training: Calibration

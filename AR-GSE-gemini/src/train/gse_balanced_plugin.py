@@ -18,6 +18,30 @@ from src.data.datasets import get_cifar100_lt_counts
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+# --- HELPER FUNCTIONS ---
+
+def apply_per_expert_temperature(logits, expert_names, temp_dict):
+    """
+    Apply per-expert temperature scaling to logits.
+    
+    Args:
+        logits: [B, E, C] expert logits
+        expert_names: list of expert names
+        temp_dict: dict mapping expert name -> temperature
+        
+    Returns:
+        scaled_logits: [B, E, C] temperature-scaled logits
+    """
+    if not temp_dict:
+        return logits
+    
+    scaled = logits.clone()
+    for i, name in enumerate(expert_names):
+        T = float(temp_dict.get(name, 1.0))
+        if abs(T - 1.0) > 1e-6:
+            scaled[:, i, :] = scaled[:, i, :] / T
+    return scaled
+
 # --- CONFIGURATION ---
 CONFIG = {
     'dataset': {
@@ -33,19 +57,19 @@ CONFIG = {
         'logits_dir': './outputs/logits/',
     },
     'plugin_params': {
-        'c': 0.2,  # rejection cost
+        'c': 0.3,  # rejection cost
         'M': 12,   # More iterations for better convergence  
         'gamma': 0.20,  # Reduced EMA for stability
-        'alpha_min': 0.85,   # Focused bounds around optimal region
-        'alpha_max': 1.15,   # Tighter optimal range
+        'alpha_min': 0.80,   # ✅ Nới range: 0.85 → 0.80 (dư địa cho tail boosting)
+        'alpha_max': 1.40,   # ✅ Nới range: 1.15 → 1.40 (dư địa cho head adjustment)
         'lambda_grid': [round(x, 2) for x in np.linspace(-2.0, 2.0, 41)],  # Expanded grid for comprehensive search
         'cov_target': 0.58,  # Lower target for better precision
         'objective': 'worst',  # Switch to 'worst' for tail-focused optimization
         'hybrid_beta': 0.2,  # weight for balanced term in hybrid objective
-        'alpha_steps': 5,  # More steps for precision
+        'alpha_steps': 7,  # ✅ Tăng từ 5 → 7 để có dư địa tối ưu α hơn
         'use_conditional_alpha': True,  # use conditional acceptance for alpha updates
         'tie_break_balanced': True,  # use balanced AURC for tie-breaking when optimizing worst
-        'use_eg_outer': False,  # use EG-outer for worst-group optimization
+        'use_eg_outer': True,  # use EG-outer for worst-group optimization
         'eg_outer_T': 20,  # EG outer iterations
         'eg_outer_xi': 1.0,  # EG step size
         'use_ema_mu': True,  # Apply EMA smoothing to μ updates
@@ -62,14 +86,17 @@ CONFIG = {
 }
 
 @torch.no_grad()
-def cache_eta_mix(gse_model, loader, class_to_group):
+def cache_eta_mix(gse_model, loader, class_to_group, expert_names=None, temperatures=None):
     """
     Cache mixture posteriors η̃(x) for S1, S2 by freezing all GSE components.
+    Applies per-expert temperature scaling if provided.
     
     Args:
         gse_model: Trained AR_GSE model (frozen)
         loader: DataLoader for split 
         class_to_group: [C] class to group mapping
+        expert_names: list of expert names (for temperature scaling)
+        temperatures: dict mapping expert name -> temperature
         
     Returns:
         eta_mix: [N, C] mixture posteriors
@@ -81,7 +108,11 @@ def cache_eta_mix(gse_model, loader, class_to_group):
     for logits, y in tqdm(loader, desc="Caching η̃"):
         logits = logits.to(DEVICE)
         
-        # Get mixture posterior (no margin computation needed)
+        # Apply per-expert temperature scaling if provided
+        if expert_names is not None and temperatures is not None:
+            logits = apply_per_expert_temperature(logits, expert_names, temperatures)
+        
+        # Get mixture posterior (with temperature-scaled logits)
         expert_posteriors = torch.softmax(logits, dim=-1)  # [B, E, C]
         
         # Get gating weights
@@ -192,6 +223,7 @@ def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
 def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class_to_group, K):
     """
     Compute worst-group error rate using per-group thresholds t_k.
+    Uses PREDICTED group for threshold (test-time deployable rule).
     
     Args:
         eta: mixture posteriors [N, C]
@@ -205,35 +237,40 @@ def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class
         worst_error: worst-group error (max of per-group errors)
         group_errors: list of per-group error rates
     """
-    # Compute raw margins
-    raw_margins = compute_raw_margin(eta, alpha, mu, class_to_group)  # [N]
-    
-    # Get group for each sample based on ground truth labels
-    y_groups = class_to_group[y]  # [N]
-    
-    # Per-sample threshold based on group
-    thresholds_per_sample = t_group[y_groups]  # [N]
-    
-    # Acceptance based on per-group thresholds
-    accepted = (raw_margins > thresholds_per_sample)  # [N]
-    
-    if accepted.sum() == 0:
-        return 1.0, [1.0] * K
-    
-    # Predictions  
-    alpha_per_class = alpha[class_to_group]  # [C]
-    preds = (alpha_per_class * eta).argmax(dim=1)  # [N]
-    
-    group_errors = []
-    for k in range(K):
-        mask_k = (y_groups == k) & accepted
-        if mask_k.sum() == 0:
-            group_errors.append(1.0)
-        else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
-    
-    return float(max(group_errors)), group_errors
+    with torch.no_grad():
+        # Compute raw margins
+        raw_margins = compute_raw_margin(eta, alpha, mu, class_to_group)  # [N]
+        
+        # Prediction with α: ŷ = argmax_y α_{g(y)} * η_y
+        cg = class_to_group
+        alpha_per_class = alpha[cg]  # [C]
+        yhat = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)  # [N]
+        
+        # Per-sample threshold based on PREDICTED group (test-time deployable)
+        pred_groups = cg[yhat]  # [N]
+        thresholds_per_sample = t_group[pred_groups]  # [N]
+        
+        # Hard acceptance: raw > threshold
+        accepted = (raw_margins > thresholds_per_sample)  # [N]
+        
+        if accepted.sum() == 0:
+            return 1.0, [1.0] * K
+        
+        # Predictions already computed above
+        preds = yhat
+        
+        # Group-wise errors based on ground-truth groups
+        y_groups = cg[y]  # [N]
+        group_errors = []
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
+        
+        return float(max(group_errors)), group_errors
 
 def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
     """
@@ -250,7 +287,7 @@ def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
     return hybrid_err, (worst_err, bal_err)
 
 def update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
-                                        gamma=0.3, alpha_min=0.75, alpha_max=1.35):
+                                        gamma=0.3, alpha_min=0.80, alpha_max=1.40):
     """
     Fixed-point alpha update using conditional acceptance rates per group.
     α_k ← (1-γ)α_k + γ·r̂_k where r̂_k = #{acc ∧ y∈G_k} / #{y∈G_k}
@@ -280,15 +317,72 @@ def update_alpha_fixed_point_conditional(eta_S1, y_S1, alpha, mu, c, class_to_gr
     
     return new_alpha
 
-def project_alpha(a, alpha_min=0.75, alpha_max=1.35):
+def project_alpha(a, alpha_min=0.80, alpha_max=1.40):
     """Project alpha to valid range with geometric mean normalization."""
     a = a.clamp_min(alpha_min)
     loga = a.log()
     a = torch.exp(loga - loga.mean())   # chuẩn hoá geomean=1
     return a.clamp(min=alpha_min, max=alpha_max)
 
+def update_alpha_conditional_pg(eta, y, alpha, mu, t_group, class_to_group, K,
+                                gamma=0.25, alpha_min=0.80, alpha_max=1.40):
+    """
+    Conditional alpha update using per-group thresholds (deployable rule).
+    Uses PREDICTED group for threshold selection.
+    
+    Args:
+        eta: mixture posteriors [N, C]
+        y: ground truth labels [N]
+        alpha, mu: per-group parameters [K]
+        t_group: per-group thresholds [K]
+        class_to_group: class -> group mapping [C]
+        K: number of groups
+        gamma: EMA factor
+        alpha_min, alpha_max: clipping bounds
+        
+    Returns:
+        updated alpha [K]
+    """
+    device = eta.device
+    cg = class_to_group.to(device)
+    
+    # Prediction with α: ŷ = argmax_y α_{g(y)} * η_y
+    alpha_per_class = alpha[cg]
+    yhat = (alpha_per_class.unsqueeze(0) * eta).argmax(dim=1)  # [N]
+    
+    # Compute raw margin
+    raw = compute_raw_margin(eta, alpha, mu, class_to_group)
+    
+    # Per-sample threshold based on predicted group (deployable!)
+    t_samp = t_group[cg[yhat]]  # [N]
+    
+    # Hard acceptance
+    accepted = raw > t_samp
+    
+    # Conditional acceptance per ground-truth group
+    y_groups = cg[y]
+    alpha_hat = torch.ones_like(alpha)
+    for k in range(K):
+        mask = (y_groups == k)
+        if mask.any():
+            acc_rate = (accepted & mask).float().sum() / mask.float().sum()
+            alpha_hat[k] = acc_rate + 1e-3
+        else:
+            alpha_hat[k] = 1.0
+    
+    # EMA update
+    new_alpha = (1 - gamma) * alpha + gamma * alpha_hat
+    
+    # Project: geomean=1 + clamp
+    new_alpha = new_alpha.clamp_min(alpha_min)
+    log_alpha = new_alpha.log()
+    new_alpha = torch.exp(log_alpha - log_alpha.mean())
+    new_alpha = new_alpha.clamp(min=alpha_min, max=alpha_max)
+    
+    return new_alpha
+
 def update_alpha_fixed_point_blend(eta_S1, y_S1, alpha, mu, c, class_to_group, K,
-                                   gamma=0.25, blend_lambda=0.25, alpha_min=0.75, alpha_max=1.35):
+                                   gamma=0.25, blend_lambda=0.25, alpha_min=0.80, alpha_max=1.40):
     """
     Blended alpha update combining joint and conditional methods for stability.
     """
@@ -301,7 +395,7 @@ def update_alpha_fixed_point_blend(eta_S1, y_S1, alpha, mu, c, class_to_group, K
     return project_alpha(a_new, alpha_min, alpha_max)
 
 def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K, 
-                           gamma=0.3, alpha_min=0.75, alpha_max=1.35, use_conditional=True):
+                           gamma=0.3, alpha_min=0.80, alpha_max=1.40, use_conditional=True):
     """
     Fixed-point alpha update with option for conditional or joint acceptance.
     """
@@ -561,10 +655,14 @@ def load_data_from_logits(config):
 
 def main():
     """Main GSE-Balanced plugin training."""
+    # Set seed and deterministic behavior for reproducibility
     torch.manual_seed(CONFIG['seed'])
     np.random.seed(CONFIG['seed'])
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
     print("=== GSE-Balanced Plugin Training ===")
+    print(f"🔧 Deterministic mode enabled for reproducibility")
     
     # 1) Load data
     S1_loader, S2_loader = load_data_from_logits(CONFIG)
@@ -596,6 +694,8 @@ def main():
     
     selective_ckpt_path = gating_ckpt_path.parent / 'gating_selective.ckpt'
     selective_loaded = False
+    temperatures = None  # Will store per-expert temperatures if available
+    
     if CONFIG['plugin_params'].get('use_selective_init', False) and selective_ckpt_path.exists():
         try:
             sel_ckpt = torch.load(selective_ckpt_path, map_location=DEVICE, weights_only=False)
@@ -617,11 +717,15 @@ def main():
                 init_alpha = sel_ckpt.get('alpha', None)
                 init_mu = sel_ckpt.get('mu', None) 
                 init_t = sel_ckpt.get('t', None)
+                temperatures = sel_ckpt.get('temperatures', None)  # Load per-expert temperatures
+                if temperatures:
+                    print(f"✅ Loaded per-expert temperatures: {temperatures}")
                 selective_loaded = True
             else:
                 print("❌ Selective checkpoint incompatible with enriched features. Using random init.")
         except Exception as e:
             print(f"⚠️ Failed to load selective checkpoint ({e}). Fallback to gating_pretrained or random.")
+    
     if not selective_loaded:
         if gating_ckpt_path.exists():
             try:
@@ -664,10 +768,17 @@ def main():
         model.alpha.fill_(1.0)
         model.mu.fill_(0.0)
     
-    # 4) Cache η̃ for both splits
+    # 4) Cache η̃ for both splits with temperature scaling
     print("\n=== Caching mixture posteriors ===")
-    eta_S1, y_S1 = cache_eta_mix(model, S1_loader, class_to_group)
-    eta_S2, y_S2 = cache_eta_mix(model, S2_loader, class_to_group) 
+    if temperatures:
+        print(f"🌡️  Applying per-expert temperature scaling: {temperatures}")
+    
+    eta_S1, y_S1 = cache_eta_mix(model, S1_loader, class_to_group, 
+                                  expert_names=CONFIG['experts']['names'],
+                                  temperatures=temperatures)
+    eta_S2, y_S2 = cache_eta_mix(model, S2_loader, class_to_group,
+                                  expert_names=CONFIG['experts']['names'],
+                                  temperatures=temperatures) 
     
     print(f"✅ Cached η̃_S1: {eta_S1.shape}, y_S1: {y_S1.shape}")
     print(f"✅ Cached η̃_S2: {eta_S2.shape}, y_S2: {y_S2.shape}")
@@ -693,6 +804,7 @@ def main():
     # Check if we should use EG-outer for worst-group optimization
     if objective == 'worst' and CONFIG['plugin_params']['use_eg_outer']:
         print(f"\n=== Running GSE Worst-Group with EG-Outer (T={CONFIG['plugin_params']['eg_outer_T']}, xi={CONFIG['plugin_params']['eg_outer_xi']}) ===")
+        print(f"    α range: [{CONFIG['plugin_params']['alpha_min']}, {CONFIG['plugin_params']['alpha_max']}], alpha_steps={CONFIG['plugin_params']['alpha_steps']}")
         
         from src.train.gse_worst_eg import worst_group_eg_outer
         
@@ -703,10 +815,11 @@ def main():
             T=CONFIG['plugin_params']['eg_outer_T'], 
             xi=CONFIG['plugin_params']['eg_outer_xi'],
             lambda_grid=np.linspace(-1.2, 1.2, 41).tolist(),
-            M=8, alpha_steps=4, 
+            M=8, 
+            alpha_steps=CONFIG['plugin_params']['alpha_steps'],  # ✅ Use config value (7 steps)
             target_cov_by_group=[0.55, 0.45] if num_groups==2 else [cov_target]*num_groups,
             gamma=CONFIG['plugin_params']['gamma'],
-            use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha']  # 🔧 Fix: Use config flag
+            use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha']
         )
         
         
@@ -805,6 +918,7 @@ def main():
         'source': source_info,  # Method used to generate results
         'config': CONFIG,
         'gating_net_state_dict': model.gating_net.state_dict(),
+        'temperatures': temperatures,  # ✅ Save per-expert temperatures for consistent eval
     }
     
     # Add extra information based on method used

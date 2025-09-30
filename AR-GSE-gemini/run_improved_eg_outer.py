@@ -40,7 +40,7 @@ if __name__ == '__main__':
     })
     
     # Update output directory for improved results
-    CONFIG['output']['checkpoints_dir'] = './checkpoints/argse_worst_eg_improved/'
+    CONFIG['output']['checkpoints_dir'] = './checkpoints/argse_worst_eg_improved_v2/'
     
     print(f"\nConfiguration:")
     print(f"  EG outer iterations: {CONFIG['plugin_params']['eg_outer_T']}")
