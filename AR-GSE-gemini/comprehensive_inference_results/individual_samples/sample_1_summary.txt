@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 1
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 18
+  Group: Head
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 18 (prob=1.0000)
+  CE          : True class prob = 1.0000
+  LogitAdj    : Top prediction = Class 18 (prob=0.9723)
+  LogitAdj    : True class prob = 0.9723
+  BalSoftmax  : Top prediction = Class 18 (prob=0.9766)
+  BalSoftmax  : True class prob = 0.9766
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0984
+  LogitAdj    : 0.4645
+  BalSoftmax  : 0.4371
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 18
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9769
+  True Class Probability: 0.9769
+  Max Probability: 0.9769
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.1391
+  Margin - Cost: -0.3391
+  Accept Probability: 0.0002
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=18, Pred=18)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 18
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction

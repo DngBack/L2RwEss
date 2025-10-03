@@ -1,0 +1,29 @@
+INDIVIDUAL SAMPLE ANALYSIS SUMMARY
+==================================================
+
+FILES GENERATED:
+This folder contains detailed analysis for selected interesting samples.
+
+For each sample, you will find:
+- sample_X.png: Comprehensive visualization with 4 panels:
+  • Expert Posteriors: How each expert assigns probabilities
+  • Gating Weights: Which expert the model trusts most
+  • Mixture Distribution: Final combined probabilities
+  • Decision Process: Margin calculation and accept/reject decision
+
+- sample_X_summary.txt: Detailed text analysis including:
+  • Ground truth information
+  • Expert predictions and confidences
+  • Gating network weights
+  • Mixture results
+  • Selective decision process
+  • Overall evaluation and outcome
+
+SAMPLES ANALYZED: 10
+Sample indices: 1, 2, 3, 4, 5, 8, 12, 23, 24, 27
+
+HOW TO USE:
+1. Start with the visualizations (.png files) for quick overview
+2. Read text summaries for detailed mathematical explanations
+3. Compare different samples to understand model behavior
+4. Focus on 'Bad' decisions to identify improvement areas

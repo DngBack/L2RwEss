@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 4
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 71
+  Group: Tail
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 5 (prob=0.6509)
+  CE          : True class prob = 0.0150
+  LogitAdj    : Top prediction = Class 58 (prob=0.2586)
+  LogitAdj    : True class prob = 0.0801
+  BalSoftmax  : Top prediction = Class 90 (prob=0.2933)
+  BalSoftmax  : True class prob = 0.0104
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0243
+  LogitAdj    : 0.8885
+  BalSoftmax  : 0.0872
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 58
+  Prediction Status: WRONG
+  Predicted Class Probability: 0.2475
+  True Class Probability: 0.0724
+  Max Probability: 0.2475
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.7690
+  Margin - Cost: -0.9690
+  Accept Probability: 0.0000
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: WRONG (True=71, Pred=58)
+  Decision: REJECT
+  Outcome: ✓ Correct Reject (Good decision)
+
+DETAILED ANALYSIS:
+  - Model incorrectly predicted Class 58 instead of Class 71
+  - Model rejected this sample (low confidence/margin)
+  - This is a GOOD decision: rejecting wrong prediction

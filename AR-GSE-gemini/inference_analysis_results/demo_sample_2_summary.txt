@@ -1,0 +1,99 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 2
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 0
+  Group: Head
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 0 (prob=0.9994)
+  CE          : True class prob = 0.9994
+  LogitAdj    : Top prediction = Class 0 (prob=0.9833)
+  LogitAdj    : True class prob = 0.9833
+  BalSoftmax  : Top prediction = Class 0 (prob=0.9847)
+  BalSoftmax  : True class prob = 0.9847
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0907
+  LogitAdj    : 0.4913
+  BalSoftmax  : 0.4180
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 0
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9854
+  True Class Probability: 0.9854
+  Max Probability: 0.9854
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.1335
+  Margin - Cost: -0.3335
+  Accept Probability: 0.0002
+  Decision: REJECT
+
+MATHEMATICAL COMPUTATION DETAILS:
+========================================
+1. MARGIN CALCULATION FORMULA:
+   m(x) = max_score - threshold
+   where:
+   • max_score = max_y α_g(y) * η̃_y(x)
+   • threshold = Σ_y' (1/α_g(y') - μ_g(y')) * η̃_y'(x) - c
+
+2. STEP-BY-STEP COMPUTATION:
+   Parameters for Head group:
+   • α_head = 1.000
+   • μ_head = -0.120
+   • Rejection cost c = 0.200
+
+   Step A: Calculate max_score
+   max_score = α_g(0) * η̃_0(x)
+            = 1.000 * 0.9854
+            = 0.9854
+
+   Step B: Calculate threshold
+   threshold = Σ_y' (1/α_g(y') - μ_g(y')) * η̃_y'(x) - c
+   Computing for top contributing classes:
+   • Class 0: (1.000 - -0.120) * 0.9854 = 1.103610
+   • Class 57: (1.000 - -0.120) * 0.0091 = 0.010207
+   • Class 83: (1.000 - -0.120) * 0.0033 = 0.003661
+   • Class 92: (1.000 - -0.120) * 0.0009 = 0.000960
+   • Class 70: (1.000 - -0.120) * 0.0003 = 0.000367
+   • Remaining classes: (1.000 - -0.120) * 0.0011 = 0.001194
+   • Sum before cost: 1.120000
+   • Final threshold: 1.120000 - 0.200 = 0.920000
+
+   Step C: Calculate raw margin
+   raw_margin = max_score - threshold
+             = 0.9854 - 0.920000
+             = -0.1335
+
+   Step D: Apply rejection cost
+   margin_with_cost = raw_margin - c
+                   = -0.1335 - 0.200
+                   = -0.3335
+
+   Step E: Calculate acceptance probability
+   accept_prob = σ(τ * margin_with_cost)
+              = σ(25.0 * -0.3335)
+              = σ(-8.34)
+              = 0.000239
+
+   Step F: Make decision
+   Decision rule: ACCEPT if accept_prob > 0.5, else REJECT
+   0.000239 <= 0.5 → REJECT
+
+3. INTERPRETATION:
+   • Raw margin < 0: Model is uncertain about prediction
+   • Margin with cost < 0: Rejection cost outweighs benefits
+   • Accept prob ≤ 0.5: Low confidence, REJECT prediction
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=0, Pred=0)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 0
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction

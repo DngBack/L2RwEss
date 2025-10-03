@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 23
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 28
+  Group: Head
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 28 (prob=0.9997)
+  CE          : True class prob = 0.9997
+  LogitAdj    : Top prediction = Class 28 (prob=1.0000)
+  LogitAdj    : True class prob = 1.0000
+  BalSoftmax  : Top prediction = Class 28 (prob=0.9984)
+  BalSoftmax  : True class prob = 0.9984
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0797
+  LogitAdj    : 0.5082
+  BalSoftmax  : 0.4122
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 28
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9993
+  True Class Probability: 0.9993
+  Max Probability: 0.9993
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.1207
+  Margin - Cost: -0.3207
+  Accept Probability: 0.0003
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=28, Pred=28)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 28
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction

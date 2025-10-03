@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 27
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 77
+  Group: Tail
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 0 (prob=0.5422)
+  CE          : True class prob = 0.1278
+  LogitAdj    : Top prediction = Class 77 (prob=0.9165)
+  LogitAdj    : True class prob = 0.9165
+  BalSoftmax  : Top prediction = Class 77 (prob=0.5414)
+  BalSoftmax  : True class prob = 0.5414
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0064
+  LogitAdj    : 0.9860
+  BalSoftmax  : 0.0076
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 77
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9086
+  True Class Probability: 0.9086
+  Max Probability: 0.9086
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: 0.0166
+  Margin - Cost: -0.1834
+  Accept Probability: 0.0101
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=77, Pred=77)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 77
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction

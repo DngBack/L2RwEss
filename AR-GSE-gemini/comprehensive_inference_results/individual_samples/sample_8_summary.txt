@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 8
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 22
+  Group: Head
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 22 (prob=0.9973)
+  CE          : True class prob = 0.9973
+  LogitAdj    : Top prediction = Class 22 (prob=0.9953)
+  LogitAdj    : True class prob = 0.9953
+  BalSoftmax  : Top prediction = Class 22 (prob=0.8592)
+  BalSoftmax  : True class prob = 0.8592
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0801
+  LogitAdj    : 0.8373
+  BalSoftmax  : 0.0827
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 22
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9842
+  True Class Probability: 0.9842
+  Max Probability: 0.9842
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.1356
+  Margin - Cost: -0.3356
+  Accept Probability: 0.0002
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=22, Pred=22)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 22
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction
