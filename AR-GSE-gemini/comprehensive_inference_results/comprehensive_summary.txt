@@ -1,0 +1,92 @@
+AR-GSE COMPREHENSIVE INFERENCE ANALYSIS
+============================================================
+
+EXPERIMENT SETUP:
+- Total samples: 50 (30 Head + 20 Tail)
+- Random sampling with seed=42
+- Model: AR-GSE with balanced plugin
+- Experts: CE, LogitAdj, BalSoftmax
+- Rejection cost: 0.2
+- Temperature: 25.0
+
+OVERALL PERFORMANCE:
+- Prediction Accuracy: 0.600 (30/50)
+- Acceptance Rate: 0.000 (0/50)
+- Head Group Accuracy: 0.833
+- Tail Group Accuracy: 0.250
+- Head Group Acceptance: 0.000
+- Tail Group Acceptance: 0.000
+
+DECISION QUALITY BREAKDOWN:
+- Correct Accepts (Good): 0
+- Incorrect Accepts (Bad): 0
+- Correct Rejects (Good): 20
+- Incorrect Rejects (Bad): 30
+- Decision Quality: 0.400
+
+EXPERT GATING WEIGHTS (Average):
+- CE          : 0.075
+- LogitAdj    : 0.693
+- BalSoftmax  : 0.232
+
+MARGIN STATISTICS:
+- Raw Margin (Mean±Std): -0.442±0.249
+- Margin with Cost: -0.642±0.249
+- Accept Probability: 0.000±0.001
+
+INDIVIDUAL SAMPLE RESULTS:
+----------------------------------------------------------------------------------------------------
+ID | Group | True | Pred | Correct | Accept | Margin | AcceptProb | Decision Quality
+----------------------------------------------------------------------------------------------------
+ 0 | Head |  18 |  18 | ✓       | ✗      | -0.339 |     0.000 | Bad (IR)
+ 1 | Head |  21 |   3 | ✗       | ✗      | -0.846 |     0.000 | Good (CR)
+ 2 | Head |  16 |  16 | ✓       | ✗      | -0.338 |     0.000 | Bad (IR)
+ 3 | Tail |  71 |  58 | ✗       | ✗      | -0.969 |     0.000 | Good (CR)
+ 4 | Tail |  91 |  27 | ✗       | ✗      | -0.753 |     0.000 | Good (CR)
+ 5 | Head |  17 |  37 | ✗       | ✗      | -0.631 |     0.000 | Good (CR)
+ 6 | Head |  26 |  45 | ✗       | ✗      | -0.736 |     0.000 | Good (CR)
+ 7 | Head |  22 |  22 | ✓       | ✗      | -0.336 |     0.000 | Bad (IR)
+ 8 | Head |   4 |   4 | ✓       | ✗      | -0.942 |     0.000 | Bad (IR)
+ 9 | Head |   2 |   2 | ✓       | ✗      | -0.338 |     0.000 | Bad (IR)
+10 | Tail |  91 |  51 | ✗       | ✗      | -0.709 |     0.000 | Good (CR)
+11 | Tail |  81 |  39 | ✗       | ✗      | -1.029 |     0.000 | Good (CR)
+12 | Tail |  77 |  74 | ✗       | ✗      | -0.965 |     0.000 | Good (CR)
+13 | Tail |  73 |  30 | ✗       | ✗      | -0.967 |     0.000 | Good (CR)
+14 | Head |  23 |  23 | ✓       | ✗      | -0.498 |     0.000 | Bad (IR)
+15 | Tail |  89 |   8 | ✗       | ✗      | -0.848 |     0.000 | Good (CR)
+16 | Head |   0 |  53 | ✗       | ✗      | -0.933 |     0.000 | Good (CR)
+17 | Head |   2 |   2 | ✓       | ✗      | -0.516 |     0.000 | Bad (IR)
+18 | Tail |  94 |  87 | ✗       | ✗      | -0.861 |     0.000 | Good (CR)
+19 | Head |  28 |  28 | ✓       | ✗      | -0.361 |     0.000 | Bad (IR)
+20 | Head |   5 |   5 | ✓       | ✗      | -0.564 |     0.000 | Bad (IR)
+21 | Head |   1 |   1 | ✓       | ✗      | -0.332 |     0.000 | Bad (IR)
+22 | Head |  28 |  28 | ✓       | ✗      | -0.321 |     0.000 | Bad (IR)
+23 | Tail |  78 |  84 | ✗       | ✗      | -1.000 |     0.000 | Good (CR)
+24 | Head |  28 |  28 | ✓       | ✗      | -0.322 |     0.000 | Bad (IR)
+25 | Tail |  71 |  71 | ✓       | ✗      | -0.709 |     0.000 | Bad (IR)
+26 | Tail |  77 |  77 | ✓       | ✗      | -0.183 |     0.010 | Bad (IR)
+27 | Head |   2 |   2 | ✓       | ✗      | -0.566 |     0.000 | Bad (IR)
+28 | Tail |  75 |  27 | ✗       | ✗      | -0.861 |     0.000 | Good (CR)
+29 | Tail |  89 |  58 | ✗       | ✗      | -0.607 |     0.000 | Good (CR)
+30 | Head |   5 |   5 | ✓       | ✗      | -0.338 |     0.000 | Bad (IR)
+31 | Tail |  86 |  16 | ✗       | ✗      | -0.894 |     0.000 | Good (CR)
+32 | Head |   6 |   6 | ✓       | ✗      | -0.322 |     0.000 | Bad (IR)
+33 | Head |  46 |  46 | ✓       | ✗      | -0.766 |     0.000 | Bad (IR)
+34 | Head |  19 |  19 | ✓       | ✗      | -0.850 |     0.000 | Bad (IR)
+35 | Head |   0 |   0 | ✓       | ✗      | -0.501 |     0.000 | Bad (IR)
+36 | Tail |  74 |  74 | ✓       | ✗      | -0.800 |     0.000 | Bad (IR)
+37 | Tail |  70 |  54 | ✗       | ✗      | -0.714 |     0.000 | Good (CR)
+38 | Tail |  75 |  75 | ✓       | ✗      | -0.865 |     0.000 | Bad (IR)
+39 | Head |   3 |  21 | ✗       | ✗      | -0.745 |     0.000 | Good (CR)
+40 | Tail |  82 |  82 | ✓       | ✗      | -0.578 |     0.000 | Bad (IR)
+41 | Head |  25 |  25 | ✓       | ✗      | -0.612 |     0.000 | Bad (IR)
+42 | Head |   0 |   0 | ✓       | ✗      | -0.901 |     0.000 | Bad (IR)
+43 | Head |  11 |  11 | ✓       | ✗      | -0.342 |     0.000 | Bad (IR)
+44 | Tail |  69 |  95 | ✗       | ✗      | -0.910 |     0.000 | Good (CR)
+45 | Tail |  72 |  55 | ✗       | ✗      | -0.988 |     0.000 | Good (CR)
+46 | Head |  14 |  14 | ✓       | ✗      | -0.345 |     0.000 | Bad (IR)
+47 | Head |   5 |   5 | ✓       | ✗      | -0.365 |     0.000 | Bad (IR)
+48 | Head |   0 |   0 | ✓       | ✗      | -0.533 |     0.000 | Bad (IR)
+49 | Head |   5 |   5 | ✓       | ✗      | -0.347 |     0.000 | Bad (IR)
+----------------------------------------------------------------------------------------------------
+Legend: CA=Correct Accept, CR=Correct Reject, IA=Incorrect Accept, IR=Incorrect Reject

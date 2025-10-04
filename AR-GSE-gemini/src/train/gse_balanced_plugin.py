@@ -36,8 +36,8 @@ CONFIG = {
         'c': 0.2,  # rejection cost
         'M': 12,   # More iterations for better convergence  
         'gamma': 0.20,  # Reduced EMA for stability
-        'alpha_min': 0.85,   # Focused bounds around optimal region
-        'alpha_max': 1.15,   # Tighter optimal range
+        'alpha_min': 0.8,   # Focused bounds around optimal region
+        'alpha_max': 1.4,   # Tighter optimal range
         'lambda_grid': [round(x, 2) for x in np.linspace(-2.0, 2.0, 41)],  # Expanded grid for comprehensive search
         'cov_target': 0.58,  # Lower target for better precision
         'objective': 'worst',  # Switch to 'worst' for tail-focused optimization

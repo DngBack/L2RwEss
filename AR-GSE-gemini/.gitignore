@@ -2,3 +2,5 @@
 *.ckpt
 *.gz
 *.pth
+
+data/*

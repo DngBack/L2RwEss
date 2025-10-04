@@ -1,0 +1,33 @@
+AR-GSE INFERENCE ANALYSIS - OVERALL SUMMARY
+============================================================
+
+EXPLANATION OF TERMS:
+- True Label: Ground truth class
+- Predicted: Model's prediction (mixture of experts)
+- 'Pred Wrong': Prediction ≠ True Label (prediction error)
+- 'Pred Correct': Prediction = True Label (correct prediction)
+- Decision ACCEPT: Model confident, accepts prediction
+- Decision REJECT: Model uncertain, rejects prediction
+
+DECISION QUALITY ANALYSIS:
+✓ GOOD DECISIONS:
+  - Accept + Pred Correct: High confidence, correct prediction
+  - Reject + Pred Wrong: Low confidence, avoided wrong prediction
+✗ BAD DECISIONS:
+  - Accept + Pred Wrong: High confidence, but wrong prediction
+  - Reject + Pred Correct: Low confidence, missed correct prediction
+
+FILES GENERATED:
+- demo_sample_X.png: Visualization showing full distributions
+- demo_sample_X_summary.txt: Detailed analysis for each sample
+- overall_analysis.txt: This summary file
+
+KEY INSIGHTS FROM VISUALIZATIONS:
+1. Expert Posteriors: Shows how each expert (CE, LogitAdj, BalSoftmax) 
+   assigns probabilities across all 100 classes
+2. Gating Weights: Shows which expert the model trusts most
+3. Mixture Distribution: Final probabilities after expert combination
+4. Decision Process: Margin calculation leading to accept/reject
+
+SAMPLE ANALYSIS COMPLETED
+Check individual sample files for detailed breakdowns.

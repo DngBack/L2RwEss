@@ -1,0 +1,43 @@
+AR-GSE INFERENCE ANALYSIS - SAMPLE 3
+============================================================
+
+GROUND TRUTH INFORMATION:
+  True Label: Class 16
+  Group: Head
+
+EXPERT PREDICTIONS:
+  CE          : Top prediction = Class 16 (prob=0.9904)
+  CE          : True class prob = 0.9904
+  LogitAdj    : Top prediction = Class 16 (prob=0.9855)
+  LogitAdj    : True class prob = 0.9855
+  BalSoftmax  : Top prediction = Class 16 (prob=0.9675)
+  BalSoftmax  : True class prob = 0.9675
+
+GATING NETWORK WEIGHTS:
+  CE          : 0.0910
+  LogitAdj    : 0.5782
+  BalSoftmax  : 0.3308
+  Dominant expert: LogitAdj
+
+MIXTURE RESULT:
+  Predicted Class: 16
+  Prediction Status: CORRECT
+  Predicted Class Probability: 0.9800
+  True Class Probability: 0.9800
+  Max Probability: 0.9800
+
+SELECTIVE DECISION PROCESS:
+  Raw Margin: -0.1377
+  Margin - Cost: -0.3377
+  Accept Probability: 0.0002
+  Decision: REJECT
+
+OVERALL EVALUATION:
+  Prediction: CORRECT (True=16, Pred=16)
+  Decision: REJECT
+  Outcome: ✗ Incorrect Reject (Bad decision)
+
+DETAILED ANALYSIS:
+  - Model correctly predicted Class 16
+  - Model rejected this sample (low confidence/margin)
+  - This is a BAD decision: rejecting correct prediction

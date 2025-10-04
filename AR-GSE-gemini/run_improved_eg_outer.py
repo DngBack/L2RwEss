@@ -29,8 +29,8 @@ if __name__ == '__main__':
     
     # Apply all improvements to CONFIG
     CONFIG['plugin_params'].update({
-        'objective': 'balanced',
-        'use_eg_outer': False,
+        'objective': 'worst',
+        'use_eg_outer': True,
         'eg_outer_T': 30,           # More iterations
         'eg_outer_xi': 0.2,         # Reduced step size for stability
         'use_conditional_alpha': True,  # Enable blended updates
@@ -42,14 +42,14 @@ if __name__ == '__main__':
     # Update output directory for improved results
     CONFIG['output']['checkpoints_dir'] = './checkpoints/argse_worst_eg_improved/'
     
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  EG outer iterations: {CONFIG['plugin_params']['eg_outer_T']}")
     print(f"  EG step size: {CONFIG['plugin_params']['eg_outer_xi']}")
     print(f"  Inner iterations: {CONFIG['plugin_params']['M']}")
     print(f"  Alpha method: {'blended' if CONFIG['plugin_params']['use_conditional_alpha'] else 'joint'}")
     print(f"  Output: {CONFIG['output']['checkpoints_dir']}")
     
-    print(f"\nStarting training...")
+    print("\nStarting training...")
     main()
     
     print("\n" + "=" * 60)
