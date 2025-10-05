@@ -29,8 +29,8 @@ if __name__ == '__main__':
     
     # Apply all improvements to CONFIG
     CONFIG['plugin_params'].update({
-        'objective': 'balanced',
-        'use_eg_outer': False,
+        'objective': 'worst',
+        'use_eg_outer': True,
         'eg_outer_T': 30,           # More iterations
         'eg_outer_xi': 0.2,         # Reduced step size for stability
         'use_conditional_alpha': True,  # Enable blended updates

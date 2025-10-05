@@ -204,7 +204,11 @@ def gse_constrained_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K, config
     patience = config['patience']
     warmup_iters = config['warmup_iters']
     
+<<<<<<< HEAD
     print("=== GSE Constrained Plugin ===")
+=======
+    print(f"=== GSE Constrained Plugin ===")
+>>>>>>> 5b1d42a3fd07cc09b4bf501b408f82e641b3922a
     print(f"Coverage constraint: τ ≥ {tau:.2f}")
     print(f"Outer iterations: {T}")
     print(f"Dual step size: {eta_dual}, Primal: {eta_primal}")
@@ -470,7 +474,11 @@ def main():
     print(f"✅ Cached η̃_S2: {eta_S2.shape}, y_S2: {y_S2.shape}")
     
     # 5) Run constrained optimization
+<<<<<<< HEAD
     print("\n=== Running Constrained Plugin Optimization ===")
+=======
+    print(f"\n=== Running Constrained Plugin Optimization ===")
+>>>>>>> 5b1d42a3fd07cc09b4bf501b408f82e641b3922a
     alpha_star, mu_star, t_star, history = gse_constrained_plugin(
         eta_S1=eta_S1.to(DEVICE),
         y_S1=y_S1.to(DEVICE),
@@ -482,7 +490,11 @@ def main():
     )
     
     # 6) Final evaluation
+<<<<<<< HEAD
     print("\n=== Final Results ===")
+=======
+    print(f"\n=== Final Results ===")
+>>>>>>> 5b1d42a3fd07cc09b4bf501b408f82e641b3922a
     final_e_k, final_cov_k, _, _ = compute_group_metrics(
         eta_S2.to(DEVICE), y_S2.to(DEVICE), alpha_star.to(DEVICE), 
         mu_star.to(DEVICE), t_star, class_to_group.to(DEVICE), num_groups
