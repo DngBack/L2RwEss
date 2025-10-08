@@ -1,0 +1,16 @@
+\begin{table}[t]
+\centering
+\caption{Selective Classification Performance on CIFAR-100-LT}
+\label{tab:main_results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{AURC-Std} $\downarrow$ & \textbf{AURC-Bal} $\downarrow$ & \textbf{AURC-Worst} $\downarrow$ \\
+\midrule
+AR-GSE (Ours) & 0.1613 & 0.2925 & \textbf{0.4300} \\
+SelectiveNet & - & - & - \\
+L2R-LongTail & - & - & - \\
+\midrule
+Oracle & 0.0882 & 0.1425 & 0.1962 \\
+\bottomrule
+\end{tabular}
+\end{table}

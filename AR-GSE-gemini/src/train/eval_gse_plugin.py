@@ -6,6 +6,7 @@ Loads optimal (α*, μ*) and evaluates on test set.
 import torch
 import torchvision
 import numpy as np
+import pandas as pd
 import json
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -38,6 +39,11 @@ CONFIG = {
     'eval_params': {
         'coverage_points': [0.7, 0.8, 0.9],
         'bootstrap_n': 1000,
+    },
+    'aurc_eval': {
+        'cost_values': np.linspace(0.0, 0.8, 81),  # 81 cost values from 0 to 0.8
+        'metrics': ['standard', 'balanced', 'worst'],
+        'n_repeats': 5,  # Number of bootstrap repeats for confidence intervals
     },
     'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
     'output_dir': './results_worst_eg_improved/cifar100_lt_if100',
@@ -212,6 +218,333 @@ def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_grou
             risk_k = err_k * acc_k + c_cost * (1.0 - acc_k)
             worst = max(worst, risk_k)
         return worst
+
+def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, metric_type="balanced"):
+    """
+    Compute group-aware risk for AURC evaluation.
+    
+    Args:
+        preds: [N] predictions
+        labels: [N] true labels
+        accepted_mask: [N] acceptance mask
+        class_to_group: [C] class to group mapping
+        K: number of groups
+        metric_type: 'standard', 'balanced', or 'worst'
+    
+    Returns:
+        risk: scalar risk value
+    """
+    if accepted_mask.sum() == 0:
+        return 1.0  # All rejected -> max risk
+    
+    y = labels
+    g = class_to_group[y]
+    
+    if metric_type == 'standard':
+        # Standard error (overall accuracy on accepted)
+        correct = (preds[accepted_mask] == y[accepted_mask])
+        return 1.0 - correct.float().mean().item()
+    
+    # Group-aware metrics
+    group_errors = []
+    for k in range(K):
+        group_mask = (g == k)
+        group_accepted = accepted_mask & group_mask
+        
+        if group_accepted.sum() == 0:
+            group_errors.append(1.0)  # No accepted samples in this group
+        else:
+            group_correct = (preds[group_accepted] == y[group_accepted])
+            group_error = 1.0 - group_correct.float().mean().item()
+            group_errors.append(group_error)
+    
+    if metric_type == 'balanced':
+        return float(np.mean(group_errors))
+    elif metric_type == 'worst':
+        return float(np.max(group_errors))
+    else:
+        raise ValueError(f"Unknown metric type: {metric_type}")
+
+def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_group, K, 
+                                   cost_c, metric_type="balanced"):
+    """
+    Find optimal threshold that minimizes: risk + c * (1 - coverage)
+    
+    Args:
+        confidence_scores: [N] confidence scores (GSE margins)
+        preds: [N] predictions
+        labels: [N] true labels
+        class_to_group: [C] class to group mapping
+        K: number of groups
+        cost_c: rejection cost
+        metric_type: risk metric type
+        
+    Returns:
+        optimal_threshold: scalar threshold value
+    """
+    # Create candidate thresholds from unique confidence scores
+    unique_scores = torch.unique(confidence_scores)
+    thresholds = torch.cat([torch.tensor([confidence_scores.min().item() - 1.0]), 
+                           unique_scores, 
+                           torch.tensor([confidence_scores.max().item() + 1.0])])
+    thresholds = torch.sort(thresholds, descending=True)[0]  # High to low
+    
+    best_cost = float('inf')
+    best_threshold = 0.0
+    
+    for threshold in thresholds:
+        accepted = confidence_scores >= threshold
+        coverage = accepted.float().mean().item()
+        risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, metric_type)
+        
+        # Objective: risk + c * rejection_rate
+        objective = risk + cost_c * (1.0 - coverage)
+        
+        if objective < best_cost:
+            best_cost = objective
+            best_threshold = threshold.item()
+    
+    return best_threshold
+
+def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val, 
+                          confidence_scores_test, preds_test, labels_test,
+                          class_to_group, K, cost_values, metric_type="balanced"):
+    """
+    Sweep cost values and return (cost, coverage, risk) points on test set.
+    
+    Args:
+        confidence_scores_val: [N_val] validation confidence scores
+        preds_val: [N_val] validation predictions
+        labels_val: [N_val] validation labels
+        confidence_scores_test: [N_test] test confidence scores
+        preds_test: [N_test] test predictions
+        labels_test: [N_test] test labels
+        class_to_group: [C] class to group mapping
+        K: number of groups
+        cost_values: array of cost values to sweep
+        metric_type: risk metric type
+        
+    Returns:
+        rc_points: list of (cost, coverage, risk) tuples
+    """
+    rc_points = []
+    
+    print(f"🔄 Sweeping {len(cost_values)} cost values for {metric_type} metric...")
+    
+    for i, cost_c in enumerate(cost_values):
+        # Find optimal threshold on validation
+        optimal_threshold = find_optimal_threshold_for_cost(
+            confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, metric_type
+        )
+        
+        # Apply to test set
+        accepted_test = confidence_scores_test >= optimal_threshold
+        coverage_test = accepted_test.float().mean().item()
+        risk_test = compute_group_risk_for_aurc(preds_test, labels_test, accepted_test, 
+                                               class_to_group, K, metric_type)
+        
+        rc_points.append((cost_c, coverage_test, risk_test))
+        
+        if (i + 1) % 20 == 0:
+            print(f"   Progress: {i+1}/{len(cost_values)} - Current: c={cost_c:.3f}, "
+                  f"cov={coverage_test:.3f}, risk={risk_test:.3f}")
+    
+    return rc_points
+
+def compute_aurc_from_points(rc_points):
+    """
+    Compute AURC using trapezoidal integration.
+    
+    Args:
+        rc_points: List of (cost, coverage, risk) tuples
+        
+    Returns:
+        aurc: scalar AURC value
+    """
+    # Sort by coverage
+    rc_points = sorted(rc_points, key=lambda x: x[1])
+    
+    coverages = [p[1] for p in rc_points]
+    risks = [p[2] for p in rc_points]
+    
+    # Ensure we have endpoints for proper integration
+    if coverages[0] > 0.0:
+        coverages = [0.0] + coverages
+        risks = [0.0] + risks  # Risk is 0 when coverage is 0
+    
+    if coverages[-1] < 1.0:
+        coverages = coverages + [1.0]
+        risks = risks + [risks[-1]]  # Extend last risk to coverage=1
+    
+    # Trapezoidal integration
+    aurc = np.trapz(risks, coverages)
+    return aurc
+
+def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, output_dir):
+    """
+    Comprehensive AURC evaluation following "Learning to Reject Meets Long-tail Learning" methodology.
+    
+    Args:
+        eta_mix: [N] mixture posteriors 
+        preds: [N] predictions
+        labels: [N] true labels
+        class_to_group: [C] class to group mapping
+        K: number of groups
+        output_dir: output directory path
+        
+    Returns:
+        aurc_results: dict with AURC results for different metrics
+    """
+    print("\n" + "="*60)
+    print("COMPREHENSIVE AURC EVALUATION")
+    print("="*60)
+    
+    # Use GSE margins as confidence scores
+    alpha_star = torch.tensor([1.0, 1.0])  # Placeholder - will be loaded from checkpoint
+    mu_star = torch.tensor([0.0, 0.0])     # Placeholder - will be loaded from checkpoint
+    confidence_scores = compute_margin(eta_mix, alpha_star, mu_star, 0.0, class_to_group)
+    
+    # Split into validation and test (80-20 split)
+    n_total = len(labels)
+    n_val = int(0.8 * n_total)
+    
+    # Random split with fixed seed for reproducibility
+    torch.manual_seed(CONFIG['seed'])
+    perm = torch.randperm(n_total)
+    val_idx = perm[:n_val]
+    test_idx = perm[n_val:]
+    
+    # Validation data
+    confidence_val = confidence_scores[val_idx]
+    preds_val = preds[val_idx]
+    labels_val = labels[val_idx]
+    
+    # Test data
+    confidence_test = confidence_scores[test_idx]
+    preds_test = preds[test_idx]
+    labels_test = labels[test_idx]
+    
+    print(f"📊 Data splits - Val: {len(val_idx)}, Test: {len(test_idx)}")
+    
+    # Get cost values and metrics from config
+    cost_values = CONFIG['aurc_eval']['cost_values']
+    metrics = CONFIG['aurc_eval']['metrics']
+    
+    print(f"🎯 Cost grid: {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
+    
+    # Sweep costs for different metrics
+    aurc_results = {}
+    all_rc_points = {}
+    
+    for metric in metrics:
+        print(f"\n🔄 Processing {metric} metric...")
+        rc_points = sweep_cost_values_aurc(
+            confidence_val, preds_val, labels_val,
+            confidence_test, preds_test, labels_test,
+            class_to_group, K, cost_values, metric
+        )
+        
+        # Compute AURC
+        aurc = compute_aurc_from_points(rc_points)
+        aurc_results[metric] = aurc
+        all_rc_points[metric] = rc_points
+        
+        print(f"✅ {metric.upper()} AURC: {aurc:.6f}")
+    
+    # Save detailed results
+    print(f"\n💾 Saving AURC results to {output_dir}...")
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save RC points as CSV
+    results_df = []
+    for metric, rc_points in all_rc_points.items():
+        for cost_c, coverage, risk in rc_points:
+            results_df.append({
+                'metric': metric,
+                'cost': cost_c,
+                'coverage': coverage,
+                'risk': risk
+            })
+    
+    results_df = pd.DataFrame(results_df)
+    results_df.to_csv(output_path / 'aurc_detailed_results.csv', index=False)
+    
+    # Save AURC summary
+    with open(output_path / 'aurc_summary.json', 'w') as f:
+        json.dump(aurc_results, f, indent=4)
+    
+    # Plot RC curves
+    plot_aurc_curves(all_rc_points, aurc_results, output_path / 'aurc_curves.png')
+    
+    print("✅ AURC evaluation completed!")
+    
+    return aurc_results, all_rc_points
+
+def plot_aurc_curves(all_rc_points, aurc_results, save_path):
+    """Plot risk-coverage curves for different metrics."""
+    plt.figure(figsize=(15, 5))
+    
+    colors = ['blue', 'red', 'green', 'orange']
+    linestyles = ['-', '--', '-.', ':']
+    
+    # Full range plot
+    plt.subplot(1, 3, 1)
+    for i, (metric, rc_points) in enumerate(all_rc_points.items()):
+        rc_points = sorted(rc_points, key=lambda x: x[1])
+        coverages = [p[1] for p in rc_points]
+        risks = [p[2] for p in rc_points]
+        
+        aurc = aurc_results[metric]
+        plt.plot(coverages, risks, color=colors[i % len(colors)], 
+                linestyle=linestyles[i % len(linestyles)], linewidth=2,
+                label=f'{metric.title()} (AURC={aurc:.4f})')
+    
+    plt.xlabel('Coverage (Fraction Accepted)')
+    plt.ylabel('Risk (Error on Accepted)')
+    plt.title('Risk-Coverage Curves (Full Range)')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.xlim(0, 1)
+    plt.ylim(0, None)
+    
+    # Focused range plot (0.2-1.0)
+    plt.subplot(1, 3, 2)
+    for i, (metric, rc_points) in enumerate(all_rc_points.items()):
+        rc_points = sorted(rc_points, key=lambda x: x[1])
+        coverages = [p[1] for p in rc_points if p[1] >= 0.2]
+        risks = [p[2] for p in rc_points if p[1] >= 0.2]
+        
+        plt.plot(coverages, risks, color=colors[i % len(colors)], 
+                linestyle=linestyles[i % len(linestyles)], linewidth=2,
+                label=f'{metric.title()}')
+    
+    plt.xlabel('Coverage (Fraction Accepted)')
+    plt.ylabel('Risk (Error on Accepted)')
+    plt.title('Risk-Coverage Curves (0.2-1.0)')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.xlim(0.2, 1.0)
+    plt.ylim(0, None)
+    
+    # AURC comparison bar plot
+    plt.subplot(1, 3, 3)
+    metrics = list(aurc_results.keys())
+    aurcs = list(aurc_results.values())
+    
+    bars = plt.bar(metrics, aurcs, color=colors[:len(metrics)], alpha=0.7)
+    plt.ylabel('AURC Value')
+    plt.title('AURC Comparison')
+    plt.xticks(rotation=45)
+    
+    # Add value labels on bars
+    for bar, aurc in zip(bars, aurcs):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                f'{aurc:.4f}', ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Saved AURC plots to {save_path}")
 
 def main():
     torch.manual_seed(CONFIG['seed'])
@@ -435,6 +768,95 @@ def main():
         print(f"  Cost c={c_cost:.2f}: Balanced={bal_risk:.4f}, Worst={worst_risk:.4f}")
     results['selective_risks'] = selective_risks
     
+    # 5.8 Comprehensive AURC Evaluation (following "Learning to Reject Meets Long-tail Learning" methodology)
+    print("\n" + "="*60)
+    print("COMPREHENSIVE AURC EVALUATION")
+    print("="*60)
+    
+    # Load alpha* and mu* from checkpoint for proper GSE margin computation
+    alpha_star_cpu = checkpoint['alpha'].cpu()
+    mu_star_cpu = checkpoint['mu'].cpu()
+    
+    # Use GSE margins as confidence scores
+    gse_margins = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    
+    # Split into validation and test (80-20 split) for proper AURC evaluation
+    n_total = len(test_labels)
+    n_val = int(0.8 * n_total)
+    
+    # Random split with fixed seed for reproducibility
+    torch.manual_seed(CONFIG['seed'])
+    perm = torch.randperm(n_total)
+    val_idx = perm[:n_val]
+    test_idx = perm[n_val:]
+    
+    # Validation data
+    gse_margins_val = gse_margins[val_idx]
+    preds_val = preds[val_idx]
+    labels_val = test_labels[val_idx]
+    
+    # Test data  
+    gse_margins_test = gse_margins[test_idx]
+    preds_test = preds[test_idx]
+    labels_test = test_labels[test_idx]
+    
+    print(f"📊 AURC Data splits - Val: {len(val_idx)}, Test: {len(test_idx)}")
+    
+    # Get cost values and metrics from config
+    cost_values = CONFIG['aurc_eval']['cost_values']
+    metrics = CONFIG['aurc_eval']['metrics']
+    
+    print(f"🎯 Cost grid: {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
+    
+    # Sweep costs for different metrics
+    aurc_results = {}
+    all_rc_points = {}
+    
+    for metric in metrics:
+        print(f"\n🔄 Processing {metric} metric...")
+        rc_points = sweep_cost_values_aurc(
+            gse_margins_val, preds_val, labels_val,
+            gse_margins_test, preds_test, labels_test,
+            class_to_group_cpu, num_groups, cost_values, metric
+        )
+        
+        # Compute AURC
+        aurc = compute_aurc_from_points(rc_points)
+        aurc_results[metric] = aurc
+        all_rc_points[metric] = rc_points
+        
+        print(f"✅ {metric.upper()} AURC: {aurc:.6f}")
+    
+    # Save AURC results
+    results['aurc_results'] = aurc_results
+    
+    # Save detailed AURC data
+    aurc_results_df = []
+    for metric, rc_points in all_rc_points.items():
+        for cost_c, coverage, risk in rc_points:
+            aurc_results_df.append({
+                'metric': metric,
+                'cost': cost_c,
+                'coverage': coverage,
+                'risk': risk
+            })
+    
+    aurc_df = pd.DataFrame(aurc_results_df)
+    aurc_df.to_csv(output_dir / 'aurc_detailed_results.csv', index=False)
+    
+    # Plot AURC curves
+    plot_aurc_curves(all_rc_points, aurc_results, output_dir / 'aurc_curves.png')
+    
+    print("\n" + "="*60)
+    print("FINAL AURC RESULTS")
+    print("="*60)
+    for metric in metrics:
+        aurc = aurc_results[metric]
+        print(f"• {metric.upper():>12} AURC: {aurc:.6f}")
+    print("="*60)
+    print("📝 Lower AURC is better (less area under risk-coverage curve)")
+    print("🎯 These results can be directly compared with 'Learning to Reject Meets Long-tail Learning'")
+    
     # 6. Save results
     with open(output_dir / 'metrics.json', 'w') as f:
         json.dump(results, f, indent=4)
@@ -490,17 +912,25 @@ def main():
     
     print()
     print("Key Results:")
+    print("📊 Traditional RC Metrics (using margins from existing method):")
     print(f"• AURC (Balanced): {aurc_bal:.4f}")
     print(f"• AURC (Worst): {aurc_wst:.4f}") 
     
+    print("\n🎯 Comprehensive AURC (following 'Learning to Reject' methodology):")
+    for metric in ['standard', 'balanced', 'worst']:
+        if metric in aurc_results:
+            print(f"• {metric.upper()} AURC: {aurc_results[metric]:.6f}")
+    
     if t_group is not None:
-        print(f"• Plugin @ per-group thresholds: Coverage={plugin_metrics['coverage']:.3f}, "
+        print(f"\n• Plugin @ per-group thresholds: Coverage={plugin_metrics['coverage']:.3f}, "
               f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
     else:
-        print(f"• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
+        print(f"\n• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
               f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
     
     print(f"• ECE: {ece:.4f}")
+    print("\n📁 AURC detailed results saved to: aurc_detailed_results.csv")
+    print("📊 AURC curves saved to: aurc_curves.png")
     print("="*60)
 
 if __name__ == '__main__':

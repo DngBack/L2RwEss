@@ -34,7 +34,7 @@ CONFIG = {
     },
     'gating_params': {
         'epochs': 25,         # More epochs for better convergence
-        'batch_size': 256,
+        'batch_size': 2,
         'lr': 8e-4,          # Slightly reduced for stability
         'weight_decay': 2e-4, # Increased weight decay 
         'balanced_training': True,  # Enable tail-aware training

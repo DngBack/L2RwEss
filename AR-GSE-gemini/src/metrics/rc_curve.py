@@ -130,3 +130,71 @@ def calculate_aurc_from_02(rc_dataframe, risk_key='balanced_error'):
         aurc_normalized = risks[0] if len(risks) > 0 else 1.0
     
     return aurc_normalized
+
+def generate_rc_curve_paper_methodology(margins, preds, labels, class_to_group, num_groups, 
+                                       c_values=None, target_coverage=0.7):
+    """
+    Generate RC curve following paper methodology:
+    1. Sweep over different rejection costs c
+    2. For each c, optimize threshold t to achieve target coverage
+    3. Compute risk at that (c, t) pair
+    4. AURC = average risk over all c values
+    
+    Args:
+        margins: Raw margins (without rejection cost) [N]
+        preds: Predicted labels [N]
+        labels: True labels [N] 
+        class_to_group: Class to group mapping [C]
+        num_groups: Number of groups
+        c_values: List of rejection costs to sweep over
+        target_coverage: Target coverage to achieve for each c
+        
+    Returns:
+        rc_data: List of dicts with c, coverage, balanced_error, worst_error
+    """
+    if c_values is None:
+        # Default rejection costs from 0.1 to 0.9 
+        c_values = np.linspace(0.1, 0.9, 21)
+    
+    rc_data = []
+    
+    for c in c_values:
+        # Compute margin with rejection cost: margin = raw_margin - c
+        margin_with_c = margins - c
+        
+        # Find threshold t to achieve target coverage
+        t = torch.quantile(margin_with_c, 1.0 - target_coverage)
+        
+        # Accept samples where margin_with_c >= t  
+        accepted_mask = margin_with_c >= t
+        
+        # Calculate metrics
+        metrics = calculate_selective_errors(preds, labels, accepted_mask, class_to_group, num_groups)
+        
+        rc_data.append({
+            'rejection_cost': c,
+            'threshold': t.item(),
+            'coverage': metrics['coverage'],
+            'balanced_error': metrics['balanced_error'],
+            'worst_error': metrics['worst_error'],
+            'group_errors': metrics['group_errors']
+        })
+    
+    return rc_data
+
+def calculate_paper_aurc(rc_data, risk_key='balanced_error'):
+    """
+    Calculate AURC using paper methodology: average risk over rejection costs.
+    
+    Args:
+        rc_data: Output from generate_rc_curve_paper_methodology
+        risk_key: 'balanced_error' or 'worst_error'
+        
+    Returns:
+        AURC value (average risk over all c values)
+    """
+    if not rc_data:
+        return 1.0
+    
+    risks = [entry[risk_key] for entry in rc_data]
+    return float(np.mean(risks))
