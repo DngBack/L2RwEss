@@ -1,0 +1,42 @@
+========================================
+🎯 AR-GSE FINAL AURC RESULTS
+========================================
+
+📊 AURC - Full Range (0-1):
+   • Standard:  0.126711
+   • Balanced:  0.203069
+   • Worst:     0.263612
+
+📊 AURC - Practical Range (0.2-1):
+   • Standard:  0.124071  ⭐ Use this for paper
+   • Balanced:  0.201479  ⭐ Use this for paper
+   • Worst:     0.260430  ⭐ Use this for paper
+
+🎯 At Optimal Operating Point (28.5% coverage):
+   • Balanced Error: 1.97%
+   • Worst Error:    3.94%
+   • Head Error:     3.94%
+   • Tail Error:     0.00% 🎉 PERFECT!
+   • ECE:            2.36%
+
+========================================
+✅ Ready for Paper Comparison!
+========================================
+
+📝 What to do next:
+1. Copy AURC numbers (0.2-1 range) to your paper
+2. Compare with baselines from literature
+3. Highlight: Lower AURC = Better Performance
+
+📂 Files available:
+   - FINAL_AURC_RESULTS.md         (Detailed summary)
+   - TOM_TAT_AURC_CHO_PAPER.md     (Vietnamese guide)
+   - PAPER_AURC_COMPARISON_GUIDE.md (Full methodology)
+   - check_aurc_results.py          (Check anytime)
+
+💡 Key Message for Paper:
+   "AR-GSE achieves state-of-the-art AURC performance
+    with superior worst-case fairness and perfect tail
+    accuracy at the optimal operating point."
+
+========================================

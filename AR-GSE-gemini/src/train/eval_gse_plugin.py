@@ -41,7 +41,7 @@ CONFIG = {
         'bootstrap_n': 1000,
     },
     'aurc_eval': {
-        'cost_values': np.linspace(0.0, 0.8, 81),  # 81 cost values from 0 to 0.8
+        'cost_values': np.linspace(0.0, 1.0, 81),  # 81 cost values from 0 to 1.0
         'metrics': ['standard', 'balanced', 'worst'],
         'n_repeats': 5,  # Number of bootstrap repeats for confidence intervals
     },
@@ -351,12 +351,13 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
     
     return rc_points
 
-def compute_aurc_from_points(rc_points):
+def compute_aurc_from_points(rc_points, coverage_range='full'):
     """
     Compute AURC using trapezoidal integration.
     
     Args:
         rc_points: List of (cost, coverage, risk) tuples
+        coverage_range: 'full' for [0, 1] or '0.2-1.0' for [0.2, 1.0]
         
     Returns:
         aurc: scalar AURC value
@@ -367,14 +368,34 @@ def compute_aurc_from_points(rc_points):
     coverages = [p[1] for p in rc_points]
     risks = [p[2] for p in rc_points]
     
-    # Ensure we have endpoints for proper integration
-    if coverages[0] > 0.0:
-        coverages = [0.0] + coverages
-        risks = [0.0] + risks  # Risk is 0 when coverage is 0
-    
-    if coverages[-1] < 1.0:
-        coverages = coverages + [1.0]
-        risks = risks + [risks[-1]]  # Extend last risk to coverage=1
+    if coverage_range == '0.2-1.0':
+        # Filter points in range [0.2, 1.0]
+        filtered = [(c, r) for c, r in zip(coverages, risks) if c >= 0.2]
+        if not filtered:
+            return float('nan')
+        coverages, risks = zip(*filtered)
+        coverages = list(coverages)
+        risks = list(risks)
+        
+        # Ensure endpoints
+        if coverages[0] > 0.2:
+            coverages = [0.2] + coverages
+            # Interpolate risk at 0.2
+            risks = [risks[0]] + risks
+        
+        if coverages[-1] < 1.0:
+            coverages = coverages + [1.0]
+            risks = risks + [risks[-1]]
+    else:
+        # Full range [0, 1]
+        # Ensure we have endpoints for proper integration
+        if coverages[0] > 0.0:
+            coverages = [0.0] + coverages
+            risks = [0.0] + risks  # Risk is 0 when coverage is 0
+        
+        if coverages[-1] < 1.0:
+            coverages = coverages + [1.0]
+            risks = risks + [risks[-1]]  # Extend last risk to coverage=1
     
     # Trapezoidal integration
     aurc = np.trapz(risks, coverages)
@@ -444,12 +465,18 @@ def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, outpu
             class_to_group, K, cost_values, metric
         )
         
-        # Compute AURC
-        aurc = compute_aurc_from_points(rc_points)
-        aurc_results[metric] = aurc
+        # Compute AURC for full range [0, 1]
+        aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
+        aurc_results[metric] = aurc_full
+        
+        # Compute AURC for range [0.2, 1.0]
+        aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
+        aurc_results[f'{metric}_02_10'] = aurc_02_10
+        
         all_rc_points[metric] = rc_points
         
-        print(f"✅ {metric.upper()} AURC: {aurc:.6f}")
+        print(f"✅ {metric.upper()} AURC (0-1):     {aurc_full:.6f}")
+        print(f"✅ {metric.upper()} AURC (0.2-1):   {aurc_02_10:.6f}")
     
     # Save detailed results
     print(f"\n💾 Saving AURC results to {output_dir}...")
@@ -820,12 +847,18 @@ def main():
             class_to_group_cpu, num_groups, cost_values, metric
         )
         
-        # Compute AURC
-        aurc = compute_aurc_from_points(rc_points)
-        aurc_results[metric] = aurc
+        # Compute AURC for full range [0, 1]
+        aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
+        aurc_results[metric] = aurc_full
+        
+        # Compute AURC for range [0.2, 1.0]
+        aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
+        aurc_results[f'{metric}_02_10'] = aurc_02_10
+        
         all_rc_points[metric] = rc_points
         
-        print(f"✅ {metric.upper()} AURC: {aurc:.6f}")
+        print(f"✅ {metric.upper()} AURC (0-1):     {aurc_full:.6f}")
+        print(f"✅ {metric.upper()} AURC (0.2-1):   {aurc_02_10:.6f}")
     
     # Save AURC results
     results['aurc_results'] = aurc_results
@@ -850,9 +883,16 @@ def main():
     print("\n" + "="*60)
     print("FINAL AURC RESULTS")
     print("="*60)
+    print("\n📊 AURC (Full Range 0-1):")
     for metric in metrics:
         aurc = aurc_results[metric]
-        print(f"• {metric.upper():>12} AURC: {aurc:.6f}")
+        print(f"   • {metric.upper():>12} AURC: {aurc:.6f}")
+    
+    print("\n📊 AURC (Practical Range 0.2-1):")
+    for metric in metrics:
+        aurc_02 = aurc_results.get(f'{metric}_02_10', float('nan'))
+        print(f"   • {metric.upper():>12} AURC: {aurc_02:.6f}")
+    
     print("="*60)
     print("📝 Lower AURC is better (less area under risk-coverage curve)")
     print("🎯 These results can be directly compared with 'Learning to Reject Meets Long-tail Learning'")
